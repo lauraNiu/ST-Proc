@@ -582,8 +582,7 @@ class ProgressTracker:
 
 
 if __name__ == '__main__':
-    # 测试代码
-    print("🧪 测试辅助工具函数")
+    print("测试辅助工具函数")
 
     # 测试计时器
     with Timer("测试任务"):

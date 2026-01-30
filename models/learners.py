@@ -47,7 +47,7 @@ class PrototypicalContrastiveLearner:
         self.num_classes = num_classes
         self.device = device
 
-        # 正确初始化类原型（可学习参数）
+        # 正确初始化类原型
         proto_dim = projector.net[-1].out_features
         prototypes = torch.randn(num_classes, proto_dim)
         nn.init.xavier_uniform_(prototypes)
@@ -602,7 +602,7 @@ class SemiSupervisedPrototypicalLearner(PrototypicalContrastiveLearner):
 
         return loss
 
-# ==================== 工厂函数 ====================
+
 def create_learner(
         learner_type: str,
         encoder: nn.Module,

@@ -368,7 +368,7 @@ class Trainer:
                 if extra is not None and extra.size(1) >= 2:
                     extra[:, :2] = (extra[:, :2] @ R.T) * scale
 
-            # small global translation（仅位置）
+            # small global translation
             if torch.rand(1).item() > 0.7:
                 shift = torch.randn(1, 2, device=x.device) * trans_std
                 pos = pos + shift
@@ -674,12 +674,12 @@ class SemiSupervisedTrainer(Trainer):
             batch_idx = self.pseudo_labels_dict['indices']
             pseudo_loss = self._compute_pseudo_loss(z1, labels, batch_idx)
 
-        # 一致性（teacher-student，已在你代码中）
+        # 一致性（teacher-student）
         consistency_loss = torch.tensor(0.0, device=self.device)
         if self.consistency_weight > 0:
             with torch.no_grad():
                 teacher_emb = self.teacher_encoder(features, coords, lengths)
-                teacher_z = self.projector(teacher_emb)  # 若你已改成 teacher_projector，请对应修改
+                teacher_z = self.projector(teacher_emb)
                 teacher_z = F.normalize(teacher_z, dim=1)
             student_z = F.normalize(z1, dim=1)
             consistency_loss = self.consistency_loss_fn(student_z, teacher_z)

@@ -24,7 +24,7 @@ class ImprovedGeoLifeDataLoader:
         """
         self.data_root = data_root
 
-        # ✅ 原始标签映射（用于读取labels.txt）
+        # 原始标签映射（用于读取labels.txt）
         self.original_label_mapping = {
             'walk': 0, 'bike': 1, 'bus': 2, 'car': 3, 'subway': 4,
             'train': 5, 'airplane': 6, 'boat': 7, 'run': 8,
@@ -32,7 +32,7 @@ class ImprovedGeoLifeDataLoader:
         }
         self.min_overlap = float(min_overlap)
 
-        # ✅ 标签转换映射（原始 -> 合并后）
+        # 标签转换映射（原始 -> 合并后）
         self.label_mapping = label_mapping or {
             0: 0,  # walk
             1: 1,  # bike
@@ -51,7 +51,7 @@ class ImprovedGeoLifeDataLoader:
                       max_users: Optional[int] = None,
                       min_points: int = 20,
                       only_labeled_users: bool = True,
-                      require_valid_label: bool = True) -> List[Dict]:  # ✅ 新增参数
+                      require_valid_label: bool = True) -> List[Dict]:
         """
         加载所有用户的轨迹数据
 
@@ -59,7 +59,7 @@ class ImprovedGeoLifeDataLoader:
             max_users: 最大用户数量限制
             min_points: 轨迹最小点数阈值
             only_labeled_users: 是否只加载有标签的用户
-            require_valid_label: ✅ 是否要求轨迹必须有有效标签
+            require_valid_label:  是否要求轨迹必须有有效标签
 
         Returns:
             轨迹列表，每个元素为轨迹字典
@@ -70,7 +70,7 @@ class ImprovedGeoLifeDataLoader:
             if os.path.isdir(os.path.join(self.data_root, d))
         ])
 
-        # ✅ 如果只要有标签的用户，先过滤
+        # 如果只要有标签的用户，先过滤
         if only_labeled_users:
             labeled_users = []
             for user_id in user_dirs:
@@ -95,13 +95,13 @@ class ImprovedGeoLifeDataLoader:
                 require_valid_label=require_valid_label  # ✅ 传递参数
             )
 
-            # ✅ 统计加载和过滤的数量
+            # 统计加载和过滤的数量
             loaded_count = len(user_trajs)
             total_loaded += loaded_count
 
             trajectories.extend(user_trajs)
 
-        # ✅ 二次过滤：确保没有 label=-1 的轨迹
+        # 二次过滤：确保没有 label=-1 的轨迹
         original_count = len(trajectories)
         trajectories = [t for t in trajectories if t['label'] is not None and t['label'] >= 0]
         excluded_count = original_count - len(trajectories)
@@ -127,7 +127,7 @@ class ImprovedGeoLifeDataLoader:
         Args:
             user_id: 用户ID
             min_points: 最小点数
-            require_valid_label: ✅ 是否要求必须有有效标签
+            require_valid_label: 是否要求必须有有效标签
 
         Returns:
             用户轨迹列表（只包含有效标签的轨迹）
@@ -141,7 +141,7 @@ class ImprovedGeoLifeDataLoader:
         # 加载标签列表（基于时间范围）
         labels_list = self._load_labels(user_id)
 
-        # ✅ 如果要求有效标签但用户没有标签，直接返回
+        # 如果要求有效标签但用户没有标签，直接返回
         if require_valid_label and not labels_list:
             return trajectories
 
@@ -177,11 +177,11 @@ class ImprovedGeoLifeDataLoader:
                     labels_list, traj_start, traj_end
                 )
 
-                # ✅ 关键过滤：只保留有有效标签的轨迹
+                # 关键过滤：只保留有有效标签的轨迹
                 if require_valid_label and (label is None or label < 0):
                     continue  # 跳过无标签或无效标签的轨迹
 
-                # ✅ 只有当有有效标签时才添加
+                # 只有当有有效标签时才添加
                 if label is not None and label >= 0:
                     trajectories.append({
                         'user_id': user_id,
@@ -224,14 +224,14 @@ class ImprovedGeoLifeDataLoader:
                     end_time_str = parts[1]
                     mode = parts[2].lower()
 
-                    # ✅ 获取原始标签
+                    # 获取原始标签
                     if mode in self.original_label_mapping:
                         original_label = self.original_label_mapping[mode]
 
-                        # ✅ 转换为合并后的标签
+                        # 转换为合并后的标签
                         merged_label = self.label_mapping.get(original_label, -1)
 
-                        # ✅ 只保留有效标签（不是-1）
+                        # 只保留有效标签（不是-1）
                         if merged_label >= 0:
                             start_time = pd.to_datetime(start_time_str)
                             end_time = pd.to_datetime(end_time_str)
@@ -303,7 +303,7 @@ class ImprovedGeoLifeDataLoader:
         if labels:
             label_counts = Counter(labels)
 
-            # ✅ 使用合并后的标签名称
+            # 使用合并后的标签名称
             merged_label_names = {
                 0: 'walk', 1: 'bike', 2: 'bus',
                 3: 'car', 4: 'subway'

@@ -204,7 +204,6 @@ class UnifiedVisualizer:
 
         fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
-        # 左图
         if labels is not None:
             unique_l = np.unique(labels[labels >= 0]) if (labels >= 0).any() else np.unique(labels)
             sc1 = axes[0].scatter(emb2d_1[:, 0], emb2d_1[:, 1], c=labels, cmap='tab10', alpha=0.6, s=50)
@@ -224,7 +223,6 @@ class UnifiedVisualizer:
         axes[0].set_ylabel('Dimension 2');
         axes[0].grid(alpha=0.3)
 
-        # 右图
         if labels is not None:
             unique_l = np.unique(labels[labels >= 0]) if (labels >= 0).any() else np.unique(labels)
             sc2 = axes[1].scatter(emb2d_2[:, 0], emb2d_2[:, 1], c=labels, cmap='tab10', alpha=0.6, s=50)

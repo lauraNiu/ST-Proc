@@ -1,7 +1,6 @@
 # main.py
 """
-轨迹交通方式识别系统 - 主程序入口
-支持训练、评估、推理等多种模式
+轨迹交通方式识别
 """
 
 import os
@@ -57,7 +56,7 @@ warnings.filterwarnings('ignore')
 
 
 class TransportModeRecognitionPipeline:
-    """完整的交通方式识别流水线"""
+    """交通方式识别"""
 
     def __init__(self, config: Config, mode='train'):
         """
@@ -68,13 +67,8 @@ class TransportModeRecognitionPipeline:
         self.config = config
         self.mode = mode
 
-        # 设置设备
         self.device = get_device(use_cuda=(config.experiment.device == 'cuda'))
-
-        # 使用Config中已经设置好的实验目录
         self.exp_dir = Path(config.exp_dir)
-
-        # 修改: 使用新的日志系统
         self.logger = get_logger(
             exp_name=config.experiment.exp_name,
             log_dir=str(self.exp_dir.parent)
@@ -83,14 +77,11 @@ class TransportModeRecognitionPipeline:
         self.logger.log_section(f"🚀 初始化交通方式识别系统 (模式: {mode})")
         self.logger.info(f"📁 实验目录: {self.exp_dir}")
         self.logger.info(f"🖥️  设备: {self.device}")
-
-        # 设置随机种子
         set_seed(config.data.random_seed)
 
         # 标签名称映射
         self.label_names = config.label_names
 
-        # 初始化组件
         self.data_loader = None
         self.preprocessor = None
         self.train_dataset = None
@@ -101,7 +92,7 @@ class TransportModeRecognitionPipeline:
         self.trainer = None
         self.scaler = None
 
-        # 修改: 初始化可视化器
+        # 初始化可视化器
         self.embedding_viz = EmbeddingVisualizer()
         self.training_viz = TrainingVisualizer()
         self.cluster_viz = ClusterVisualizer()
@@ -114,7 +105,7 @@ class TransportModeRecognitionPipeline:
 
     def _split_dataset(self, trajectories: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         """
-        ✅ 改进：数据集划分（考虑标签分布）
+        数据集划分（考虑标签分布）
         """
         from sklearn.model_selection import train_test_split
         from collections import Counter
@@ -142,7 +133,7 @@ class TransportModeRecognitionPipeline:
         else:
             self.logger.warning("⚠️  有标签样本不足，使用随机划分")
 
-        # 执行数据划分
+        # 数据划分
         train_indices, val_indices = train_test_split(
             np.arange(len(trajectories)),
             test_size=self.config.data.test_size,
@@ -156,7 +147,7 @@ class TransportModeRecognitionPipeline:
         return train_trajectories, val_trajectories
 
     def setup_data(self):
-        """步骤1: 设置数据加载和预处理 - 修改版"""
+        """步骤1: 设置数据加载和预处理"""
         self.logger.log_section("📂 步骤1: 数据加载与预处理")
 
         with Timer("数据加载"):
@@ -166,12 +157,12 @@ class TransportModeRecognitionPipeline:
                 min_overlap=self.config.data.get('min_label_overlap', 0.35)  # 新增：可调到 0.5
             )
 
-            # ✅ 只加载有标签的用户
+            # 只加载有标签的用户
             raw_trajectories = self.data_loader.load_all_data(
                 max_users=self.config.data.max_users,
                 min_points=self.config.data.min_points,
                 only_labeled_users=True,  # 只使用有标签的用户
-                require_valid_label=True  # ✅ 要求轨迹必须有有效标签
+                require_valid_label=True  # 要求轨迹必须有有效标签
             )
 
             if len(raw_trajectories) == 0:
@@ -189,10 +180,10 @@ class TransportModeRecognitionPipeline:
             trajectories = [t for t in trajectories if t['label'] is not None and t['label'] >= 0]
             self.logger.info(f"✅ 保留 {len(trajectories)} 条有标签轨迹")
 
-        # ✅ 先分层划分
+        # 先分层划分
         train_trajectories, val_trajectories = self._split_dataset_stratified(trajectories)
 
-        # ✅ 在训练集上 fit，再分别 transform
+        # 在训练集上 fit，再分别 transform
         with Timer("特征标准化"):
             from sklearn.preprocessing import StandardScaler
             self.scaler = StandardScaler()
@@ -210,14 +201,14 @@ class TransportModeRecognitionPipeline:
                 t['features'] = val_feats_scaled[i]
 
 
-        # ✅ 保存完整标签（用于评估）
+        # 保存完整标签
         self.train_full_labels = np.array([t['label'] for t in train_trajectories])
         self.val_full_labels = np.array([t['label'] for t in val_trajectories])
 
         self.logger.info(f"   训练集完整标签: {len(self.train_full_labels)} 条")
         self.logger.info(f"   验证集完整标签: {len(self.val_full_labels)} 条")
 
-        # ✅ 3. 应用标签掩码(训练用,深拷贝)
+        # 3. 应用标签掩码(训练用,深拷贝)
         import copy
         train_trajectories_masked = self._apply_label_masking(
             copy.deepcopy(train_trajectories),  # 深拷贝!
@@ -233,7 +224,7 @@ class TransportModeRecognitionPipeline:
 
         self.val_dataset = TrajDataset(val_trajectories, augment=False)
 
-        # ✅ 5. 验证数据一致性
+        # 5. 验证数据一致性
         assert len(self.train_dataset) == len(self.train_full_labels), "训练集大小不匹配!"
         assert len(self.val_dataset) == len(self.val_full_labels), "验证集大小不匹配!"
 
@@ -273,7 +264,7 @@ class TransportModeRecognitionPipeline:
             trajectories: List[Dict]
     ) -> Tuple[List[Dict], List[Dict]]:
         """
-        ✅ 分层划分数据集（保证标签分布）
+        分层划分数据集（保证标签分布）
         """
         from sklearn.model_selection import train_test_split
 
@@ -294,7 +285,7 @@ class TransportModeRecognitionPipeline:
 
     def _apply_labeled_ratio(self, trajectories: List[Dict]) -> List[Dict]:
         """
-        ✅ 新增：控制标签数据比例
+        控制标签数据比例
 
         Args:
             trajectories: 轨迹列表
@@ -380,7 +371,7 @@ class TransportModeRecognitionPipeline:
 
     def _apply_label_masking(self, trajectories: List[Dict], label_ratio: float,
                              min_samples_per_class: int = 5):
-        """隐藏部分标签(深拷贝,不影响原始数据)"""
+        """隐藏部分标签"""
         from collections import Counter
 
         if label_ratio >= 1.0:
@@ -398,7 +389,7 @@ class TransportModeRecognitionPipeline:
         # 为每个类别保留指定比例的标签
         for label_id, count in label_counts.items():
             indices = [i for i, t in enumerate(masked_trajectories) if t['label'] == label_id]
-            # ✅ 关键改进: 确保每类至少保留min_samples_per_class个样本
+            # 确保每类至少保留min_samples_per_class个样本
             n_keep = max(
                 min_samples_per_class,  # 至少5个
                 int(count * label_ratio)  # 或按比例
@@ -408,12 +399,12 @@ class TransportModeRecognitionPipeline:
             np.random.seed(self.config.data.random_seed)
             keep_indices = np.random.choice(indices, size=n_keep, replace=False)
 
-            # ✅ 隐藏未选中的标签
+            # 隐藏未选中的标签
             for idx in indices:
                 if idx not in keep_indices:
                     masked_trajectories[idx]['label'] = -1
 
-        # ✅ 统计可见标签
+        # 统计可见标签
         visible_labels = [t['label'] for t in masked_trajectories if t['label'] >= 0]
         self.logger.info(
             f"   🎯 可见标签: {len(visible_labels)}/{len(labels)} "
@@ -544,7 +535,6 @@ class TransportModeRecognitionPipeline:
         )
 
         # 创建伪标签生成器
-        # 创建伪标签生成器
         generator_name = self.config.training.pseudo_label_generator
 
         if generator_name == 'naive':
@@ -563,7 +553,7 @@ class TransportModeRecognitionPipeline:
                 top_k_consistency=3,
                 margin_threshold=0.0  # <--- 关闭 margin
             )
-        # ... (为您表格中的每个Ablation添加一个elif) ...
+
         else:
             self.logger.info("Using Full Advanced Pseudo-Label Generator")
             # Table 2, Full Model:
@@ -577,7 +567,7 @@ class TransportModeRecognitionPipeline:
                 per_class_margin=getattr(self.config.training, 'pseudo_per_class_margin', {})
             )
 
-        # ✅ 修改：传递 encoder 和 projector，而不是 learner
+        # 递 encoder 和 projector，而不是 learner
         # 将 Config 对象转换为字典
         config_dict = {
             'num_classes': self.config.experiment.num_classes,
@@ -629,12 +619,12 @@ class TransportModeRecognitionPipeline:
 
         # 开始训练
         with Timer("模型训练"):
-            history = self.trainer.fit()  # ✅ 使用 fit() 方法
+            history = self.trainer.fit()  # 使用 fit() 方法
 
         # 保存训练历史
         self._save_training_history(history)
 
-        # 修改: 使用新的可视化方法
+        # 使用新的可视化方法
         self.visualizer.plot_training_curves(
             train_losses=history.get('train_loss', []),
             val_losses=history.get('val_loss'),
@@ -644,7 +634,6 @@ class TransportModeRecognitionPipeline:
             filename='training_curves.png'
         )
 
-        # 如果有评估指标，也绘制出来
         if 'metrics' in history:
             self.visualizer.plot_metrics(
                 metrics=history['metrics'],
@@ -653,13 +642,11 @@ class TransportModeRecognitionPipeline:
 
         return history
 
-    # main.py (修改 evaluate 方法)
 
     def evaluate(self, checkpoint_path=None):
         """统一使用投影空间z进行所有评估"""
         self.logger.log_section("📊 步骤4: 模型评估（投影空间）")
 
-        # 加载模型...
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
@@ -669,7 +656,7 @@ class TransportModeRecognitionPipeline:
         self.encoder.eval()
         self.projector.eval()
 
-        # ✅ 只提取投影空间embeddings
+        # 只提取投影空间embeddings
         with Timer("提取投影空间embeddings"):
             z_train = self._extract_projected_embeddings_from_dataset(
                 self.train_dataset
@@ -726,7 +713,7 @@ class TransportModeRecognitionPipeline:
                 z_val, self.val_full_labels
             )
 
-        # === 4. 聚类分析（仍用z） ===
+        # === 4. 聚类分析 ===
         with Timer("聚类分析"):
             clusters, refined_clusters = perform_clustering(
                 z_all,
@@ -750,7 +737,7 @@ class TransportModeRecognitionPipeline:
                 z_all, refined_clusters, all_true_labels
             )
 
-        # === 5. 伪标签质量评估（修复逻辑） ===
+        # === 5. 伪标签质量评估===
         with Timer("伪标签质量评估"):
             pseudo_eval_results = self._evaluate_pseudo_labels_correct(
                 z_train,
@@ -762,7 +749,7 @@ class TransportModeRecognitionPipeline:
         # 保存结果...
         self._save_evaluation_results(
             cluster_results=cluster_results,
-            mode_results=proto_results,  # 注意这里叫 mode_results
+            mode_results=proto_results,  # mode_results
             cluster_to_label_map=cluster_to_label_map,
             knn_results=knn_results,
             linear_probe_results=lp_results,
@@ -836,7 +823,7 @@ class TransportModeRecognitionPipeline:
             train_true_labels: np.ndarray,
             prototypes: torch.Tensor
     ) -> Dict:
-        """修复后的伪标签质量评估"""
+        """伪标签质量评估"""
         # 获取观测标签（含-1）
         train_observed_labels = np.array([
             t['label'] for t in train_dataset.trajs
@@ -941,7 +928,7 @@ class TransportModeRecognitionPipeline:
         self.encoder.eval()
         self.projector.eval()
 
-        # 2) 加载训练阶段的特征标准化器（如果存在）
+        # 2) 加载训练阶段的特征标准化器
         scaler_path = self.exp_dir / 'data' / 'scaler.pkl'
         if scaler_path.exists():
             try:
@@ -1199,8 +1186,6 @@ class TransportModeRecognitionPipeline:
 
         return all_embeddings, all_labels
 
-    # main.py (TransportModeRecognitionPipeline)
-
     def _build_pseudo_label_generator(self):
         """构建与训练阶段一致的伪标签生成器（用于评估）"""
         name = getattr(self.config.training, 'pseudo_label_generator', 'advanced')
@@ -1345,14 +1330,6 @@ class TransportModeRecognitionPipeline:
         """生成所有可视化结果 - 使用 UnifiedVisualizer"""
         self.logger.info("📈 生成可视化结果...")
 
-        # 直接调用 UnifiedVisualizer 的综合报告方法
-        # 这会自动生成所有需要的可视化
-
-        # 但我们需要先准备 cluster_results 和 mode_results
-        # 这两个在 evaluate() 中已经生成，所以可以作为参数传入
-
-        # 为了兼容性，这里手动调用各个可视化方法
-
         # 1. 聚类可视化
         self.visualizer.plot_embeddings_2d(
             embeddings,
@@ -1464,7 +1441,7 @@ class TransportModeRecognitionPipeline:
                 self.setup_data()
                 self.setup_model()
                 self.train()
-                # ✅ 修复：传入最佳模型路径
+                # 传入最佳模型路径
                 best_model_path = Path(self.checkpoint_dir) / 'best_model.pth'
                 if best_model_path.exists():
                     self.evaluate(checkpoint_path=str(best_model_path))
@@ -1501,8 +1478,6 @@ class TransportModeRecognitionPipeline:
             raise
 
         finally:
-
-            # 添加这个finally块
 
             if hasattr(self, 'logger'):
                 self.logger.close()
@@ -1597,7 +1572,7 @@ def main():
     # 加载配置
     config = Config(config_path=args.config)
 
-    # ✅ 覆盖标签比例配置
+    # 覆盖标签比例配置
     if args.labeled_ratio is not None:
         if 0.0 <= args.labeled_ratio <= 1.0:
             config.data.labeled_ratio = args.labeled_ratio
@@ -1610,7 +1585,7 @@ def main():
         config._setup_paths()  # 重新设置路径
 
     if args.data:
-        # 添加推理数据路径（可以扩展experiment配置）
+        # 添加推理数据路径
         config.experiment.__dict__['inference_data_path'] = args.data
 
     if args.debug:

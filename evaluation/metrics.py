@@ -1,5 +1,5 @@
 """
-评估指标模块 - 增强版
+评估指标模块
 提供完整的评估指标和可解释性分析
 """
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class TransportModeEvaluator:
-    """交通方式识别评估器 - 增强版"""
+    """交通方式识别评估器"""
 
     def __init__(self, label_names: Dict[int, str], save_dir: str = './results'):
         """

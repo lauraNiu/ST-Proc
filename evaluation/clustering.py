@@ -182,13 +182,13 @@ class ClusterLabelMapper:
 
 
 class HierarchicalClusterRefiner:
-    """✅ 修复：层次聚类优化器 - 防止过度分裂"""
+    """层次聚类优化器 - 防止过度分裂"""
 
     def __init__(
             self,
-            n_sub_clusters: int = 3,  # ✅ 从6降低到3
-            min_cluster_size: int = 50,  # ✅ 从20提高到50
-            max_refinement_depth: int = 1  # ✅ 新增：限制细化深度
+            n_sub_clusters: int = 3,
+            min_cluster_size: int = 50,
+            max_refinement_depth: int = 1  # 限制细化深度
     ):
         """
         Args:
@@ -204,7 +204,7 @@ class HierarchicalClusterRefiner:
             self,
             embeddings: np.ndarray,
             initial_clusters: np.ndarray,
-            depth: int = 0  # ✅ 新增：跟踪递归深度
+            depth: int = 0  # 跟踪递归深度
     ) -> np.ndarray:
         """
         对初始聚类结果进行层次化优化
@@ -217,7 +217,7 @@ class HierarchicalClusterRefiner:
         Returns:
             优化后的簇标签
         """
-        # ✅ 检查递归深度
+        # 检查递归深度
         if depth >= self.max_refinement_depth:
             logger.info(f"   达到最大细化深度 {depth}，停止细化")
             return initial_clusters
@@ -231,21 +231,21 @@ class HierarchicalClusterRefiner:
             cluster_mask = initial_clusters == cluster_id
             cluster_embeddings = embeddings[cluster_mask]
 
-            # ✅ 跳过小簇
+            # 跳过小簇
             if len(cluster_embeddings) < self.min_cluster_size:
                 logger.debug(f"   跳过小簇 {cluster_id} (size={len(cluster_embeddings)})")
                 continue
 
-            # ✅ 动态确定子簇数量（避免过度分裂）
+            # 动态确定子簇数量（避免过度分裂）
             n_subs = min(
                 self.n_sub_clusters,
-                max(2, len(cluster_embeddings) // 30)  # ✅ 从10改为30
+                max(2, len(cluster_embeddings) // 30)
             )
 
             if n_subs < 2:
                 continue
 
-            # ✅ 使用轮廓系数评估是否需要细化
+            # 使用轮廓系数评估是否需要细化
             try:
                 from sklearn.metrics import silhouette_score
 
@@ -260,14 +260,14 @@ class HierarchicalClusterRefiner:
                 if len(np.unique(sub_labels)) > 1:
                     sub_silhouette = silhouette_score(cluster_embeddings, sub_labels)
 
-                    # ✅ 只有轮廓系数提升才进行细化
-                    if sub_silhouette > 0.1:  # ✅ 设置阈值
+                    # 只有轮廓系数提升才进行细化
+                    if sub_silhouette > 0.1:  # 设置阈值
                         unique_subs = np.unique(sub_labels)
                         for i, sub_id in enumerate(unique_subs):
                             sub_mask = sub_labels == sub_id
                             global_indices = np.where(cluster_mask)[0][sub_mask]
 
-                            # ✅ 使用更简单的编号方案
+                            # 使用更简单的编号方案
                             new_cluster_id = len(np.unique(refined_clusters)) + i
                             refined_clusters[global_indices] = new_cluster_id
 
@@ -291,12 +291,12 @@ class HierarchicalClusterRefiner:
 def perform_clustering(
         embeddings: np.ndarray,
         n_clusters: int = 11,
-        method: str = 'kmeans',  # ✅ 新增：支持多种聚类方法
-        refine: bool = True,  # ✅ 新增：是否进行层次优化
+        method: str = 'kmeans',  # 支持多种聚类方法
+        refine: bool = True,  # 是否进行层次优化
         logger=None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    ✅ 改进：执行聚类分析
+    执行聚类分析
 
     Args:
         embeddings: 嵌入向量
@@ -311,13 +311,13 @@ def perform_clustering(
     if logger:
         logger.info(f"🔍 开始聚类 (method={method}, n_clusters={n_clusters})")
 
-    # ✅ 支持多种聚类方法
+    # 支持多种聚类方法
     if method == 'kmeans':
         clusterer = KMeans(
             n_clusters=n_clusters,
             random_state=42,
-            n_init=20,  # ✅ 增加初始化次数
-            max_iter=500  # ✅ 增加最大迭代次数
+            n_init=20,  # 增加初始化次数
+            max_iter=500  # 增加最大迭代次数
         )
         initial_clusters = clusterer.fit_predict(embeddings)
 
@@ -329,7 +329,7 @@ def perform_clustering(
         initial_clusters = clusterer.fit_predict(embeddings)
 
     elif method == 'dbscan':
-        # ✅ DBSCAN自动确定簇数量
+        # DBSCAN自动确定簇数量
         from sklearn.neighbors import NearestNeighbors
 
         # 使用k-distance图确定eps
@@ -348,7 +348,7 @@ def perform_clustering(
     else:
         raise ValueError(f"Unknown clustering method: {method}")
 
-    # ✅ 可选的层次优化
+    # 层次优化
     if refine and method != 'dbscan':
         refiner = HierarchicalClusterRefiner(
             n_sub_clusters=3,

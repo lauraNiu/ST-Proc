@@ -190,7 +190,6 @@ class FeatureEncoder(nn.Module):
         """
         return self.net(x)
 
-
 class AdaptiveTrajectoryEncoder(nn.Module):
     """
     自适应轨迹编码器
@@ -207,7 +206,7 @@ class AdaptiveTrajectoryEncoder(nn.Module):
         """
         super().__init__()
 
-        self.encoder_mode = encoder_mode  # <--- 保存模式
+        self.encoder_mode = encoder_mode
 
         # 空间编码器
         self.spatial_encoder = AttentionSpatialEncoder(
@@ -269,7 +268,7 @@ class AdaptiveTrajectoryEncoder(nn.Module):
 
         # Ablation 3 (Simple Fusion)
         if self.encoder_mode == 'simple_fusion':
-            # 假设 "Simple Fusion" 是拼接后过MLP
+
             combined = torch.cat([spatial_emb, feature_emb], dim=1)
             embedding = self.fusion(combined)
             return embedding

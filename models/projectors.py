@@ -134,7 +134,6 @@ class AdaptiveProjectionHead(nn.Module):
         return output
 
 
-# 测试代码
 if __name__ == '__main__':
     batch_size = 4
     input_dim = 256
@@ -142,12 +141,12 @@ if __name__ == '__main__':
 
     x = torch.randn(batch_size, input_dim)
 
-    # 测试标准投影头
+    # 标准投影头
     proj1 = ProjectionHead(input_dim, input_dim, output_dim)
     out1 = proj1(x)
     print(f"标准投影头输出: {out1.shape}")  # [4, 64]
 
-    # 测试多层投影头
+    # 多层投影头
     proj2 = MultiLayerProjectionHead(
         input_dim,
         hidden_dims=[512, 256, 128],
@@ -156,7 +155,7 @@ if __name__ == '__main__':
     out2 = proj2(x)
     print(f"多层投影头输出: {out2.shape}")  # [4, 64]
 
-    # 测试自适应投影头
+    # 自适应投影头
     proj3 = AdaptiveProjectionHead(input_dim, output_dim, num_experts=3)
     out3 = proj3(x)
     print(f"自适应投影头输出: {out3.shape}")  # [4, 64]

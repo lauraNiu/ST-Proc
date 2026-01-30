@@ -1,5 +1,5 @@
 """
-改进的数据增强：保持坐标尺度一致性
+数据增强：保持坐标尺度一致性
 """
 import numpy as np
 import torch
@@ -28,7 +28,7 @@ class CoordinateAwareAugmenter:
         coords = coords.copy()
         valid_coords = coords[:valid_length]
 
-        # 1. 添加相对噪声（相对于标准化后的范围）
+        # 1. 添加相对噪声
         if np.random.rand() > 0.5:
             noise = np.random.normal(0, self.noise_scale, valid_coords.shape)
             valid_coords += noise

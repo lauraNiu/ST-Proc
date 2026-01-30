@@ -143,7 +143,7 @@ class ExperimentLogger:
     
     def log_config(self, config: dict):
         """记录配置信息"""
-        self.log_section("⚙️  实验配置")
+        self.log_section("实验配置")
         self.log_dict(config)
         
         # 保存配置到文件
@@ -416,7 +416,6 @@ class MetricsTracker:
         }
 
 
-# ==================== 便捷函数 ====================
 
 def get_logger(
     exp_name: str,
@@ -447,7 +446,7 @@ def setup_basic_logger(name: str = "trajectory") -> logging.Logger:
 # ==================== 使用示例 ====================
 
 if __name__ == "__main__":
-    # 示例1: 基础使用
+
     with get_logger("test_experiment") as logger:
         logger.log_config({
             'model': 'ResNet50',
@@ -471,8 +470,7 @@ if __name__ == "__main__":
                 'val_loss': val_loss,
                 'accuracy': 0.7 + epoch * 0.05
             })
-    
-    # 示例2: 轻量级追踪
+
     tracker = MetricsTracker()
     
     for i in range(10):

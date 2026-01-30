@@ -47,7 +47,6 @@ class DetailedClusterAnalyzer:
         schema='36' 对应你之前的 36 维定义（向后兼容）。
         """
         if schema == '36':
-            # 旧版（你原来代码的索引；若有出入按历史版本修正）
             return {
                 'total_distance':     {'index': 0,  'unit': 'm',    'name': 'Total Distance',       'description': '总距离'},
                 'avg_speed':          {'index': 6,  'unit': 'm/s',  'name': 'Average Speed',        'description': '平均速度'},
@@ -175,7 +174,7 @@ class DetailedClusterAnalyzer:
                 feat_dim = len(trajectories[0]['features'])
                 schema = '48' if feat_dim >= 48 else '36'
             else:
-                # 若拿不到 trajectories，就默认按新 48 维（或按你需要改成 '36'）
+                # 若拿不到 trajectories，就默认按新 48 维
                 schema = '48'
             self.feature_info = self._get_feature_info(schema=schema)
         # === 自适应 schema 结束 ===
@@ -196,7 +195,7 @@ class DetailedClusterAnalyzer:
         confusion_results = self._analyze_confusion_patterns(clusters, true_labels)
         self.analysis_results['confusion'] = confusion_results
 
-        # 4. 簇特征统计（如果提供了轨迹数据）
+        # 4. 簇特征统计
         if trajectories is not None:
             feature_results = self._analyze_cluster_features(clusters, trajectories)
             self.analysis_results['features'] = feature_results

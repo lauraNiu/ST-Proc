@@ -17,7 +17,7 @@ class DataConfig:
     max_len: int = 100
     test_size: float = 0.1
     random_seed: int = 42
-    # ✅ 标签控制参数
+    # 标签控制参数
     labeled_ratio: float = 0.2  # 训练时可见标签的比例 (0.0-1.0)
     only_labeled_users: bool = True  # 只使用有标签的用户
     min_samples_per_class: int = 15  # 每类至少保留的样本数
@@ -72,10 +72,10 @@ class TrainingConfig:
     lambda_graph_contrast: float = 0.10   # 邻居对比损失权重
     graph_build_interval: int = 1         # 每多少个 epoch 重建一次全局 kNN 图
 
-    proto_margin: float = 0.15  # 新增：CosFace 风格 margin
+    proto_margin: float = 0.15  # CosFace 风格 margin
     class_weights: Optional[List[float]] = None  # 新增：按类别顺序的权重，或 None
 
-    # 伪标签 per-class 配置（可选，对 bus(2)/car(3) 建议 0.90 / 0.12）
+    # 伪标签 per-class 配置（bus(2)/car(3)  0.90 / 0.12）
     pseudo_per_class_thresholds: Dict[int, float] = field(default_factory=dict)
     pseudo_per_class_margin: Dict[int, float] = field(default_factory=dict)
 
@@ -87,8 +87,8 @@ class TrainingConfig:
 @dataclass
 class ExperimentConfig:
     """实验配置"""
-    num_clusters: int = 5  # ✅ 修改：减少到5个类别
-    num_classes: int = 5  # ✅ 修改：减少到5个类别
+    num_clusters: int = 5
+    num_classes: int = 5
     use_smote: bool = False
     use_augmentation: bool = False
     use_semi_supervised: bool = False
@@ -106,7 +106,7 @@ class Config:
     """统一配置管理器"""
 
     def __init__(self, config_path: str = None):
-        # ✅ 1. 先初始化内部路径变量
+        #  1. 先初始化内部路径变量
         self._exp_dir = None
         self._checkpoint_dir = None
         self._log_dir = None
@@ -122,7 +122,7 @@ class Config:
 
         self._setup_paths()
         # GeoLife 数据集的标准标签映射
-        # ✅ 原始标签映射（用于读取labels.txt）
+        # 原始标签映射
         self.original_label_mapping = {
             'walk': 0,
             'bike': 1,
@@ -137,7 +137,7 @@ class Config:
             'taxi': 10
         }
 
-        # ✅ 标签合并映射（原始标签ID -> 新标签ID）
+        # 标签合并映射（原始标签ID -> 新标签ID）
         self.label_mapping = {
             0: 0,  # walk -> walk
             1: 1,  # bike -> bike
@@ -154,7 +154,7 @@ class Config:
 
     def _setup_paths(self):
         """设置实验路径"""
-        # ✅ 赋值给内部变量（带下划线）
+        # 赋值给内部变量（带下划线）
         self._exp_dir = os.path.join(
             self.experiment.save_dir,
             self.experiment.exp_name
@@ -226,7 +226,7 @@ class Config:
             0: 'walk',
             1: 'bike',
             2: 'bus',
-            3: 'car',  # ✅ 合并了car和taxi
+            3: 'car',  # 合并了car和taxi
             4: 'subway'
         }
 

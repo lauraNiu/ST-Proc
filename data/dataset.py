@@ -17,19 +17,19 @@ class TrajDataset(Dataset):
     def __init__(self,
                  trajectories: List[Dict],
                  augment: bool = True,
-                 augmenter: Optional[MultiScaleAugmenter] = None):  # ✅ 添加此参数
+                 augmenter: Optional[MultiScaleAugmenter] = None):  # 添加此参数
         """
         初始化数据集
 
         Args:
             trajectories: 轨迹列表
             augment: 是否应用数据增强
-            augmenter: 数据增强器实例（可选，如果未提供则自动创建）
+            augmenter: 数据增强器实例
         """
         self.trajs = trajectories
         self.augment = augment
 
-        # ✅ 支持传入 augmenter 或自动创建
+        # 支持传入 augmenter 或自动创建
         if augment:
             self.augmenter = augmenter if augmenter is not None else CoordinateAwareAugmenter()
         else:

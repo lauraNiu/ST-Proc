@@ -67,7 +67,7 @@ class PseudoLabelGenerator:
 
 
 class AdvancedPseudoLabelGenerator:
-    """改进的伪标签生成器：支持 per-class 阈值/ margin，一致性检查，可渐进阈值"""
+    """伪标签生成器：支持 per-class 阈值/ margin，一致性检查，可渐进阈值"""
     def __init__(self,
                  confidence_threshold: float = 0.85,
                  progressive_threshold: bool = True,
@@ -235,7 +235,7 @@ class AdvancedPseudoLabelGenerator:
         }
 
 class KNNPseudoLabelGenerator:
-    """基于KNN的伪标签生成器 - 更稳健的策略"""
+    """基于KNN的伪标签生成器"""
     
     def __init__(
         self,
@@ -528,7 +528,7 @@ def graph_label_propagation(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     简单 LP：Y <- alpha * S * Y + (1-alpha) * Y0
-    - projected_embeddings: z_all (N,D)，建议已是 projector 输出（未必归一化，此处内部归一化）
+    - projected_embeddings: z_all (N,D)，已是 projector 输出（未必归一化，此处内部归一化）
     - labels: 观测标签（含 -1 表示未标注）
     返回：(pred_labels, confidences)
     """
@@ -540,7 +540,7 @@ def graph_label_propagation(
     sim = torch.mm(z, z.t())        # [N,N]
     sim.fill_diagonal_(0.0)
 
-    # kNN 稀疏邻接（不加权也可，此处用相似度作为权重，且对称化）
+    # kNN 稀疏邻接
     topk = sim.topk(k, dim=1).indices     # [N,k]
     adj = torch.zeros_like(sim)
     adj.scatter_(1, topk, sim.gather(1, topk))
