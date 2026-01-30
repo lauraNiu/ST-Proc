@@ -1,0 +1,35 @@
+2025-10-26 00:23:24 | INFO     | 🚀 实验开始: exp_001
+2025-10-26 00:23:24 | INFO     | 📁 日志目录: experiments/exp_001
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     |                       🚀 初始化交通方式识别系统 (模式: train)                       
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     | 📁 实验目录: experiments/exp_001
+2025-10-26 00:23:24 | INFO     | 🖥️  设备: cuda
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     |                            📂 步骤1: 数据加载与预处理                            
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     | 🔄 加载GeoLife数据集...
+2025-10-26 00:23:24 | ERROR    | ❌ 发生错误: [Errno 2] No such file or directory: './autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data'
+2025-10-26 00:23:24 | ERROR    | ======================================================================
+2025-10-26 00:23:24 | ERROR    | ❌ 异常发生 (Pipeline执行)
+2025-10-26 00:23:24 | ERROR    | 异常类型: FileNotFoundError
+2025-10-26 00:23:24 | ERROR    | 异常信息: [Errno 2] No such file or directory: './autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data'
+2025-10-26 00:23:24 | ERROR    | 
+堆栈跟踪:
+2025-10-26 00:23:24 | ERROR    | Traceback (most recent call last):
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 640, in run
+    self.setup_data()
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 122, in setup_data
+    raw_trajectories = self.data_loader.load_all_data(
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/data/loader.py", line 45, in load_all_data
+    d for d in os.listdir(self.data_root)
+FileNotFoundError: [Errno 2] No such file or directory: './autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data'
+
+2025-10-26 00:23:24 | ERROR    | ======================================================================
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     |                                 ✅ 实验结束                                
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     |                                 🏆 最佳指标                                
+2025-10-26 00:23:24 | INFO     | ======================================================================
+2025-10-26 00:23:24 | INFO     | 📊 指标已保存: experiments/exp_001/metrics_20251026_002324.json

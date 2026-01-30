@@ -1,0 +1,70 @@
+2025-10-26 00:44:22 | INFO     | 🚀 实验开始: exp_001
+2025-10-26 00:44:22 | INFO     | 📁 日志目录: experiments/exp_001
+2025-10-26 00:44:22 | INFO     | ======================================================================
+2025-10-26 00:44:22 | INFO     |                       🚀 初始化交通方式识别系统 (模式: train)                       
+2025-10-26 00:44:22 | INFO     | ======================================================================
+2025-10-26 00:44:22 | INFO     | 📁 实验目录: experiments/exp_001
+2025-10-26 00:44:22 | INFO     | 🖥️  设备: cuda
+2025-10-26 00:44:22 | INFO     | ======================================================================
+2025-10-26 00:44:22 | INFO     |                            📂 步骤1: 数据加载与预处理                            
+2025-10-26 00:44:22 | INFO     | ======================================================================
+2025-10-26 00:44:22 | INFO     | 🔄 加载GeoLife数据集...
+2025-10-26 00:44:32 | INFO     | ✅ 成功加载 1363 条原始轨迹
+2025-10-26 00:44:32 | INFO     | 🔧 开始数据预处理...
+2025-10-26 00:45:28 | INFO     | ✅ 成功预处理 1363 条有效轨迹
+2025-10-26 00:45:28 | INFO     | 📏 执行特征标准化...
+2025-10-26 00:45:28 | INFO     | ✅ 特征标准化完成
+2025-10-26 00:45:28 | INFO     | 📦 划分训练集和验证集...
+2025-10-26 00:45:28 | WARNING  | ⚠️  有标签样本不足，使用随机划分
+2025-10-26 00:45:28 | INFO     |    训练集: 1158 条轨迹
+2025-10-26 00:45:28 | INFO     |    验证集: 205 条轨迹
+2025-10-26 00:45:28 | INFO     | 
+训练集类别分布:
+2025-10-26 00:45:28 | INFO     |              Total:      0
+2025-10-26 00:45:28 | INFO     | 
+验证集类别分布:
+2025-10-26 00:45:28 | INFO     |              Total:      0
+2025-10-26 00:45:28 | INFO     | ✅ 预处理数据已保存: experiments/exp_001/data
+2025-10-26 00:45:28 | INFO     | ======================================================================
+2025-10-26 00:45:28 | INFO     |                              🤖 步骤2: 初始化模型                             
+2025-10-26 00:45:28 | INFO     | ======================================================================
+2025-10-26 00:45:29 | INFO     |    编码器参数量: 2,885,891
+2025-10-26 00:45:29 | INFO     |    投影头参数量: 82,752
+2025-10-26 00:45:29 | INFO     |    总参数量: 2,968,643
+2025-10-26 00:45:29 | INFO     |    ✅ 使用半监督学习框架
+2025-10-26 00:45:29 | ERROR    | ❌ 发生错误: can't optimize a non-leaf Tensor
+2025-10-26 00:45:29 | ERROR    | ======================================================================
+2025-10-26 00:45:29 | ERROR    | ❌ 异常发生 (Pipeline执行)
+2025-10-26 00:45:29 | ERROR    | 异常类型: ValueError
+2025-10-26 00:45:29 | ERROR    | 异常信息: can't optimize a non-leaf Tensor
+2025-10-26 00:45:29 | ERROR    | 
+堆栈跟踪:
+2025-10-26 00:45:29 | ERROR    | Traceback (most recent call last):
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 677, in run
+    self.setup_model()
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 308, in setup_model
+    self.learner = SemiSupervisedPrototypicalLearner(
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/models/learners.py", line 335, in __init__
+    super().__init__(
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/models/learners.py", line 58, in __init__
+    self.optimizer = optim.AdamW(
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/optim/adamw.py", line 52, in __init__
+    super().__init__(params, defaults)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/optim/optimizer.py", line 266, in __init__
+    self.add_param_group(cast(dict, param_group))
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/_compile.py", line 24, in inner
+    return torch._dynamo.disable(fn, recursive)(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py", line 328, in _fn
+    return fn(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/optim/optimizer.py", line 874, in add_param_group
+    raise ValueError("can't optimize a non-leaf Tensor")
+ValueError: can't optimize a non-leaf Tensor
+
+2025-10-26 00:45:29 | ERROR    | ======================================================================
+2025-10-26 00:45:29 | INFO     | ======================================================================
+2025-10-26 00:45:29 | INFO     |                                 ✅ 实验结束                                
+2025-10-26 00:45:29 | INFO     | ======================================================================
+2025-10-26 00:45:29 | INFO     | ======================================================================
+2025-10-26 00:45:29 | INFO     |                                 🏆 最佳指标                                
+2025-10-26 00:45:29 | INFO     | ======================================================================
+2025-10-26 00:45:29 | INFO     | 📊 指标已保存: experiments/exp_001/metrics_20251026_004422.json

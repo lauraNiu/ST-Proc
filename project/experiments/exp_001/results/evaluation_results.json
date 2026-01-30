@@ -1,0 +1,108 @@
+{
+    "config": {
+        "data": {
+            "data_root": "../Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data",
+            "max_users": 20,
+            "min_points": 20,
+            "max_len": 200,
+            "test_size": 0.15,
+            "random_seed": 42
+        },
+        "model": {
+            "hidden_dim": 256,
+            "projection_dim": 64,
+            "feat_dim": 36,
+            "coord_dim": 2,
+            "dropout": 0.3,
+            "num_encoder_layers": 2,
+            "num_attention_heads": 8
+        },
+        "training": {
+            "batch_size": 64,
+            "epochs": 100,
+            "lr": 0.0005,
+            "weight_decay": 0.0001,
+            "temperature": 0.07,
+            "proto_weight": 0.5,
+            "pseudo_weight": 0.3,
+            "consistency_weight": 0.2,
+            "patience": 30,
+            "min_delta": 0.0001,
+            "pseudo_label_interval": 5,
+            "pseudo_label_threshold": 0.6
+        },
+        "experiment": {
+            "num_clusters": 11,
+            "num_classes": 11,
+            "use_smote": false,
+            "use_augmentation": true,
+            "use_semi_supervised": true,
+            "exp_name": "exp_001",
+            "save_dir": "./experiments",
+            "device": "cuda",
+            "num_workers": 0
+        }
+    },
+    "cluster_results": {
+        "silhouette": 0.06660094112157822,
+        "davies_bouldin": 2.0489022767226994,
+        "ari": 0.4822535520324757,
+        "nmi": 0.6337537663281446,
+        "best_accuracy": 0.6363636363636364,
+        "n_clusters": 66,
+        "n_labeled": 33,
+        "n_samples": 2839
+    },
+    "mode_results": {
+        "accuracy": 0.9545454545454546,
+        "macro_f1": 0.7,
+        "weighted_f1": 0.9727272727272727,
+        "per_class": {
+            "bus": {
+                "precision": 1.0,
+                "recall": 0.6666666666666666,
+                "f1": 0.8,
+                "support": 3
+            },
+            "train": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "support": 0
+            },
+            "taxi": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 17
+            }
+        }
+    },
+    "cluster_to_label_map": {
+        "0": 0,
+        "1": 1,
+        "2": 3,
+        "3": 4,
+        "4": 6,
+        "5": 7,
+        "10": 8,
+        "11": 9,
+        "30": 2,
+        "51": 5,
+        "60": 10
+    },
+    "label_names": {
+        "0": "walk",
+        "1": "bike",
+        "2": "bus",
+        "3": "car",
+        "4": "subway",
+        "5": "train",
+        "6": "airplane",
+        "7": "boat",
+        "8": "run",
+        "9": "motorcycle",
+        "10": "taxi"
+    },
+    "timestamp": "2025-10-26T02:09:56.278015"
+}

@@ -1,0 +1,58 @@
+data:
+  data_root: /autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories
+    1.3/Geolife Trajectories 1.3/Data
+  labeled_ratio: 0.1
+  max_len: 100
+  max_users: null
+  min_label_overlap: 0.35
+  min_points: 20
+  min_samples_per_class: 15
+  only_labeled_users: true
+  random_seed: 42
+  test_size: 0.1
+experiment:
+  device: cuda
+  exp_name: exp_test_0.1
+  num_classes: 5
+  num_clusters: 5
+  num_workers: 8
+  save_dir: ./new_experiments
+  use_augmentation: false
+  use_semi_supervised: true
+  use_smote: false
+model:
+  coord_dim: 4
+  dropout: 0.3
+  encoder_mode: adaptive_gate
+  feat_dim: 48
+  hidden_dim: 128
+  num_attention_heads: 4
+  num_encoder_layers: 2
+  projection_dim: 64
+training:
+  batch_size: 64
+  class_weights: null
+  consistency_ramp_epochs: 50
+  consistency_weight: 0.2
+  epochs: 200
+  graph_build_interval: 1
+  graph_k: 10
+  lambda_graph_contrast: 0.1
+  lambda_graph_smooth: 0.05
+  lr: 0.0003
+  min_delta: 0.0001
+  patience: 50
+  proto_margin: 0.15
+  proto_weight: 1.0
+  pseudo_label_generator: advanced
+  pseudo_label_interval: 3
+  pseudo_label_threshold: 0.8
+  pseudo_per_class_margin: {}
+  pseudo_per_class_thresholds: {}
+  pseudo_ramp_epochs: 50
+  pseudo_warmup_epochs: 5
+  pseudo_weight: 0.5
+  temperature: 0.1
+  use_contrastive: true
+  use_proto: true
+  weight_decay: 0.0001

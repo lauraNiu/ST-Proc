@@ -1,0 +1,79 @@
+2025-10-26 01:11:13 | INFO     | 🚀 实验开始: exp_001
+2025-10-26 01:11:13 | INFO     | 📁 日志目录: experiments/exp_001
+2025-10-26 01:11:13 | INFO     | ======================================================================
+2025-10-26 01:11:13 | INFO     |                       🚀 初始化交通方式识别系统 (模式: train)                       
+2025-10-26 01:11:13 | INFO     | ======================================================================
+2025-10-26 01:11:13 | INFO     | 📁 实验目录: experiments/exp_001
+2025-10-26 01:11:13 | INFO     | 🖥️  设备: cuda
+2025-10-26 01:11:13 | INFO     | ======================================================================
+2025-10-26 01:11:13 | INFO     |                            📂 步骤1: 数据加载与预处理                            
+2025-10-26 01:11:13 | INFO     | ======================================================================
+2025-10-26 01:11:13 | INFO     | 🔄 加载GeoLife数据集...
+2025-10-26 01:11:20 | INFO     | ✅ 成功加载 1116 条原始轨迹
+2025-10-26 01:11:20 | INFO     | 🔧 开始数据预处理...
+2025-10-26 01:12:04 | INFO     | ✅ 成功预处理 1116 条有效轨迹
+2025-10-26 01:12:04 | INFO     | 📏 执行特征标准化...
+2025-10-26 01:12:04 | INFO     | ✅ 特征标准化完成
+2025-10-26 01:12:04 | INFO     | 📦 划分训练集和验证集...
+2025-10-26 01:12:04 | WARNING  | ⚠️  有标签样本不足，使用随机划分
+2025-10-26 01:12:04 | INFO     |    训练集: 948 条轨迹
+2025-10-26 01:12:04 | INFO     |    验证集: 168 条轨迹
+2025-10-26 01:12:04 | INFO     | 
+训练集类别分布:
+2025-10-26 01:12:04 | INFO     |              Total:      0
+2025-10-26 01:12:04 | INFO     | 
+验证集类别分布:
+2025-10-26 01:12:04 | INFO     |              Total:      0
+2025-10-26 01:12:04 | INFO     | ✅ 预处理数据已保存: experiments/exp_001/data
+2025-10-26 01:12:04 | INFO     | ======================================================================
+2025-10-26 01:12:04 | INFO     |                              🤖 步骤2: 初始化模型                             
+2025-10-26 01:12:04 | INFO     | ======================================================================
+2025-10-26 01:12:04 | INFO     |    编码器参数量: 2,885,891
+2025-10-26 01:12:04 | INFO     |    投影头参数量: 82,752
+2025-10-26 01:12:04 | INFO     |    总参数量: 2,968,643
+2025-10-26 01:12:04 | INFO     |    ✅ 使用半监督学习框架
+2025-10-26 01:12:04 | INFO     | ======================================================================
+2025-10-26 01:12:04 | INFO     |                             🏋️  步骤3: 开始训练                             
+2025-10-26 01:12:04 | INFO     | ======================================================================
+2025-10-26 01:12:05 | ERROR    | ❌ 发生错误: value cannot be converted to type at::Half without overflow
+2025-10-26 01:12:05 | ERROR    | ======================================================================
+2025-10-26 01:12:05 | ERROR    | ❌ 异常发生 (Pipeline执行)
+2025-10-26 01:12:05 | ERROR    | 异常类型: RuntimeError
+2025-10-26 01:12:05 | ERROR    | 异常信息: value cannot be converted to type at::Half without overflow
+2025-10-26 01:12:05 | ERROR    | 
+堆栈跟踪:
+2025-10-26 01:12:05 | ERROR    | Traceback (most recent call last):
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 699, in run
+    self.train()
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/main.py", line 406, in train
+    history = self.trainer.fit()  # ✅ 使用 fit() 方法
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/training/trainer.py", line 418, in fit
+    train_metrics = self.train_epoch()
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/training/trainer.py", line 215, in train_epoch
+    loss_dict = self.train_step(batch)
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/training/trainer.py", line 247, in train_step
+    loss_dict = self._compute_loss(coords, features, lengths, labels)
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/training/trainer.py", line 295, in _compute_loss
+    emb1 = self.encoder(features, view1_coords, lengths)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/models/encoders.py", line 260, in forward
+    spatial_emb = self.spatial_encoder(coords, lengths)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/autodl-fs/data/251021-mode-recognition/geolife/project/models/encoders.py", line 128, in forward
+    attention_scores = attention_scores.masked_fill(mask.unsqueeze(-1), -1e9)
+RuntimeError: value cannot be converted to type at::Half without overflow
+
+2025-10-26 01:12:05 | ERROR    | ======================================================================
+2025-10-26 01:12:05 | INFO     | ======================================================================
+2025-10-26 01:12:05 | INFO     |                                 ✅ 实验结束                                
+2025-10-26 01:12:05 | INFO     | ======================================================================
+2025-10-26 01:12:05 | INFO     | ======================================================================
+2025-10-26 01:12:05 | INFO     |                                 🏆 最佳指标                                
+2025-10-26 01:12:05 | INFO     | ======================================================================
+2025-10-26 01:12:05 | INFO     | 📊 指标已保存: experiments/exp_001/metrics_20251026_011113.json

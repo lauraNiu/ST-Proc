@@ -1,0 +1,325 @@
+{
+    "config": {
+        "data": {
+            "data_root": "/autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data",
+            "max_users": null,
+            "min_points": 20,
+            "max_len": 100,
+            "test_size": 0.1,
+            "random_seed": 42,
+            "labeled_ratio": 0.1,
+            "only_labeled_users": true,
+            "min_samples_per_class": 15,
+            "min_label_overlap": 0.35
+        },
+        "model": {
+            "hidden_dim": 128,
+            "projection_dim": 64,
+            "feat_dim": 48,
+            "coord_dim": 4,
+            "dropout": 0.3,
+            "num_encoder_layers": 2,
+            "num_attention_heads": 4,
+            "encoder_mode": "adaptive_gate"
+        },
+        "training": {
+            "batch_size": 64,
+            "epochs": 200,
+            "lr": 0.0003,
+            "weight_decay": 0.0001,
+            "temperature": 0.1,
+            "proto_weight": 1.0,
+            "pseudo_weight": 0.5,
+            "consistency_weight": 0.2,
+            "patience": 50,
+            "min_delta": 0.0001,
+            "pseudo_label_interval": 3,
+            "pseudo_label_threshold": 0.8,
+            "use_contrastive": true,
+            "use_proto": true,
+            "pseudo_label_generator": "advanced",
+            "pseudo_warmup_epochs": 5,
+            "pseudo_ramp_epochs": 50,
+            "consistency_ramp_epochs": 50,
+            "graph_k": 10,
+            "lambda_graph_smooth": 0.05,
+            "lambda_graph_contrast": 0.1,
+            "graph_build_interval": 1,
+            "proto_margin": 0.15,
+            "class_weights": null,
+            "pseudo_per_class_thresholds": {},
+            "pseudo_per_class_margin": {}
+        },
+        "experiment": {
+            "num_clusters": 5,
+            "num_classes": 5,
+            "use_smote": false,
+            "use_augmentation": false,
+            "use_semi_supervised": true,
+            "exp_name": "exp_test_0.1",
+            "save_dir": "./new_experiments",
+            "device": "cuda",
+            "num_workers": 8
+        }
+    },
+    "cluster_results": {
+        "silhouette": 0.007938016206026077,
+        "davies_bouldin": 3.749215713267221,
+        "ari": 0.053389946721991856,
+        "nmi": 0.09616505469144335,
+        "best_accuracy": 0.3111111111111111,
+        "n_clusters": 6,
+        "n_labeled": 2745,
+        "n_samples": 2745
+    },
+    "mode_results": {
+        "accuracy": 0.7329690346083789,
+        "balanced_accuracy": 0.7111227925610969,
+        "cohen_kappa": 0.6531316134077242,
+        "macro_f1": 0.7137853535284514,
+        "weighted_f1": 0.7295693668074353,
+        "micro_f1": 0.7329690346083789,
+        "macro_precision": 0.7185733717133249,
+        "macro_recall": 0.7111227925610969,
+        "weighted_precision": 0.7280041186047107,
+        "weighted_recall": 0.7329690346083789,
+        "per_class": {
+            "walk": {
+                "precision": 0.7569974554707379,
+                "recall": 0.7767624020887729,
+                "f1": 0.7667525773195877,
+                "support": 766
+            },
+            "bike": {
+                "precision": 0.7319587628865979,
+                "recall": 0.7888888888888889,
+                "f1": 0.7593582887700535,
+                "support": 630
+            },
+            "bus": {
+                "precision": 0.556930693069307,
+                "recall": 0.47468354430379744,
+                "f1": 0.5125284738041003,
+                "support": 474
+            },
+            "car": {
+                "precision": 0.8068669527896996,
+                "recall": 0.8221574344023324,
+                "f1": 0.8144404332129964,
+                "support": 686
+            },
+            "subway": {
+                "precision": 0.7401129943502824,
+                "recall": 0.6931216931216931,
+                "f1": 0.7158469945355191,
+                "support": 189
+            }
+        },
+        "per_class_detailed": {
+            "walk": {
+                "true_positive": 595,
+                "false_positive": 191,
+                "false_negative": 171,
+                "true_negative": 1788,
+                "specificity": 0.9034866093986862
+            },
+            "bike": {
+                "true_positive": 497,
+                "false_positive": 182,
+                "false_negative": 133,
+                "true_negative": 1933,
+                "specificity": 0.9139479905437352
+            },
+            "bus": {
+                "true_positive": 225,
+                "false_positive": 179,
+                "false_negative": 249,
+                "true_negative": 2092,
+                "specificity": 0.9211800968736239
+            },
+            "car": {
+                "true_positive": 564,
+                "false_positive": 135,
+                "false_negative": 122,
+                "true_negative": 1924,
+                "specificity": 0.9344341913550267
+            },
+            "subway": {
+                "true_positive": 131,
+                "false_positive": 46,
+                "false_negative": 58,
+                "true_negative": 2510,
+                "specificity": 0.9820031298904538
+            }
+        },
+        "summary": {
+            "accuracy": 0.7329690346083789,
+            "macro_f1": 0.7137853535284514,
+            "balanced_accuracy": 0.7111227925610969
+        }
+    },
+    "cluster_to_label_map": {
+        "5": 4,
+        "6": 0,
+        "7": 1,
+        "8": 3,
+        "9": 2
+    },
+    "label_names": {
+        "0": "walk",
+        "1": "bike",
+        "2": "bus",
+        "3": "car",
+        "4": "subway"
+    },
+    "timestamp": "2025-11-16T04:04:21.794805",
+    "knn_results": {
+        "k": 5,
+        "acc": 0.72,
+        "macro_f1": 0.6899106367633584,
+        "report": {
+            "0": {
+                "precision": 0.6702127659574468,
+                "recall": 0.8181818181818182,
+                "f1-score": 0.7368421052631579,
+                "support": 77.0
+            },
+            "1": {
+                "precision": 0.7761194029850746,
+                "recall": 0.8253968253968254,
+                "f1-score": 0.8,
+                "support": 63.0
+            },
+            "2": {
+                "precision": 0.5882352941176471,
+                "recall": 0.425531914893617,
+                "f1-score": 0.49382716049382713,
+                "support": 47.0
+            },
+            "3": {
+                "precision": 0.7794117647058824,
+                "recall": 0.7681159420289855,
+                "f1-score": 0.7737226277372263,
+                "support": 69.0
+            },
+            "4": {
+                "precision": 0.8333333333333334,
+                "recall": 0.5263157894736842,
+                "f1-score": 0.6451612903225806,
+                "support": 19.0
+            },
+            "accuracy": 0.72,
+            "macro avg": {
+                "precision": 0.7294625122198768,
+                "recall": 0.672708457994986,
+                "f1-score": 0.6899106367633584,
+                "support": 275.0
+            },
+            "weighted avg": {
+                "precision": 0.7191334883212791,
+                "recall": 0.72,
+                "f1-score": 0.7126968890126206,
+                "support": 275.0
+            }
+        }
+    },
+    "linear_probe_results": {
+        "acc": 0.7090909090909091,
+        "macro_f1": 0.6783537115409451,
+        "report": {
+            "0": {
+                "precision": 0.6962025316455697,
+                "recall": 0.7142857142857143,
+                "f1-score": 0.7051282051282052,
+                "support": 77.0
+            },
+            "1": {
+                "precision": 0.7692307692307693,
+                "recall": 0.7936507936507936,
+                "f1-score": 0.78125,
+                "support": 63.0
+            },
+            "2": {
+                "precision": 0.6190476190476191,
+                "recall": 0.5531914893617021,
+                "f1-score": 0.5842696629213483,
+                "support": 47.0
+            },
+            "3": {
+                "precision": 0.7236842105263158,
+                "recall": 0.7971014492753623,
+                "f1-score": 0.7586206896551724,
+                "support": 69.0
+            },
+            "4": {
+                "precision": 0.6923076923076923,
+                "recall": 0.47368421052631576,
+                "f1-score": 0.5625,
+                "support": 19.0
+            },
+            "accuracy": 0.7090909090909091,
+            "macro avg": {
+                "precision": 0.7000945645515932,
+                "recall": 0.6663827314199777,
+                "f1-score": 0.6783537115409451,
+                "support": 275.0
+            },
+            "weighted avg": {
+                "precision": 0.7063724660859904,
+                "recall": 0.7090909090909091,
+                "f1-score": 0.705478631048662,
+                "support": 275.0
+            }
+        }
+    },
+    "pseudo_eval_results": {
+        "num_hidden": 2226,
+        "accuracy": 0.715633423180593,
+        "macro_f1": 0.695559815904103,
+        "report": {
+            "walk": {
+                "precision": 0.7437106918238994,
+                "recall": 0.7616747181964574,
+                "f1-score": 0.7525855210819411,
+                "support": 621.0
+            },
+            "bike": {
+                "precision": 0.7163636363636363,
+                "recall": 0.7710371819960861,
+                "f1-score": 0.7426955702167767,
+                "support": 511.0
+            },
+            "bus": {
+                "precision": 0.5213414634146342,
+                "recall": 0.44415584415584414,
+                "f1-score": 0.4796633941093969,
+                "support": 385.0
+            },
+            "car": {
+                "precision": 0.7964601769911505,
+                "recall": 0.8093525179856115,
+                "f1-score": 0.8028545941123997,
+                "support": 556.0
+            },
+            "subway": {
+                "precision": 0.7142857142857143,
+                "recall": 0.6862745098039216,
+                "f1-score": 0.7,
+                "support": 153.0
+            },
+            "accuracy": 0.715633423180593,
+            "macro avg": {
+                "precision": 0.698432336575807,
+                "recall": 0.6944989544275841,
+                "f1-score": 0.695559815904103,
+                "support": 2226.0
+            },
+            "weighted avg": {
+                "precision": 0.7101258732757806,
+                "recall": 0.715633423180593,
+                "f1-score": 0.7120532821344431,
+                "support": 2226.0
+            }
+        }
+    }
+}

@@ -1,0 +1,38 @@
+data:
+  data_root: ../Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data
+  max_len: 200
+  max_users: 20
+  min_points: 20
+  random_seed: 42
+  test_size: 0.15
+experiment:
+  device: cuda
+  exp_name: exp_001
+  num_classes: 11
+  num_clusters: 11
+  num_workers: 0
+  save_dir: ./experiments
+  use_augmentation: true
+  use_semi_supervised: true
+  use_smote: false
+model:
+  coord_dim: 2
+  dropout: 0.3
+  feat_dim: 36
+  hidden_dim: 256
+  num_attention_heads: 8
+  num_encoder_layers: 2
+  projection_dim: 64
+training:
+  batch_size: 64
+  consistency_weight: 0.2
+  epochs: 100
+  lr: 0.0005
+  min_delta: 0.0001
+  patience: 30
+  proto_weight: 0.5
+  pseudo_label_interval: 5
+  pseudo_label_threshold: 0.6
+  pseudo_weight: 0.3
+  temperature: 0.07
+  weight_decay: 0.0001
