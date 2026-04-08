@@ -82,11 +82,10 @@ class Trainer:
         self.num_classes = config.get('num_classes', 11)
         projection_dim = config.get('projection_dim', 64)
 
-        # 创建原型参数
+        # 原型：不参与梯度优化，完全由 EMA 更新（fix #1.2：消除与 AdamW 的冲突）
         prototypes_init = torch.randn(self.num_classes, projection_dim)
         nn.init.xavier_uniform_(prototypes_init)
-        self.prototypes = nn.Parameter(prototypes_init, requires_grad=True)
-        self.prototypes.data = self.prototypes.data.to(device)
+        self.prototypes = prototypes_init.to(device)  # 普通 tensor，非 Parameter
 
         # Loss functions
         self.contrast_loss_fn = ContrastiveLoss(
@@ -132,9 +131,9 @@ class Trainer:
 
     def _build_optimizer(self) -> optim.Optimizer:
         """Build optimizer."""
+        # 原型不再是 Parameter，不加入优化器（fix #1.2）
         params = list(self.encoder.parameters()) + \
-                 list(self.projector.parameters()) + \
-                 [self.prototypes]
+                 list(self.projector.parameters())
 
         optimizer_name = self.config.get('optimizer', 'adamw').lower()
         lr = self.config.get('lr', 5e-4)
@@ -194,8 +193,7 @@ class Trainer:
     def _count_parameters(self) -> int:
         """Count trainable parameters."""
         return sum(p.numel() for p in self.encoder.parameters() if p.requires_grad) + \
-               sum(p.numel() for p in self.projector.parameters() if p.requires_grad) + \
-               self.prototypes.numel()
+               sum(p.numel() for p in self.projector.parameters() if p.requires_grad)
 
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
@@ -258,8 +256,7 @@ class Trainer:
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 list(self.encoder.parameters()) +
-                list(self.projector.parameters()) +
-                [self.prototypes],
+                list(self.projector.parameters()),
                 max_norm=self.config.get('max_grad_norm', 1.0)
             )
             self.scaler.step(self.optimizer)
@@ -268,8 +265,7 @@ class Trainer:
             loss_dict['total_loss_tensor'].backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.encoder.parameters()) +
-                list(self.projector.parameters()) +
-                [self.prototypes],
+                list(self.projector.parameters()),
                 max_norm=self.config.get('max_grad_norm', 1.0)
             )
             self.optimizer.step()
@@ -506,7 +502,7 @@ class Trainer:
             'global_step': self.global_step,
             'encoder_state_dict': self.encoder.state_dict(),
             'projector_state_dict': self.projector.state_dict(),
-            'prototypes': self.prototypes.data,
+            'prototypes': self.prototypes,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
@@ -531,7 +527,7 @@ class Trainer:
 
         self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
-        self.prototypes.data = checkpoint['prototypes'].to(self.device)
+        self.prototypes = checkpoint['prototypes'].to(self.device)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         if checkpoint.get('scheduler_state_dict') and self.scheduler:
@@ -674,26 +670,23 @@ class SemiSupervisedTrainer(Trainer):
             batch_idx = self.pseudo_labels_dict['indices']
             pseudo_loss = self._compute_pseudo_loss(z1, labels, batch_idx)
 
-        # 一致性（teacher-student）
+        # 一致性（teacher-student）：教师 encoder + 教师 projector，修复 bug #1.4
         consistency_loss = torch.tensor(0.0, device=self.device)
         if self.consistency_weight > 0:
             with torch.no_grad():
                 teacher_emb = self.teacher_encoder(features, coords, lengths)
-                teacher_z = self.projector(teacher_emb)
+                teacher_z = self.teacher_projector(teacher_emb)   # 使用 teacher projector
                 teacher_z = F.normalize(teacher_z, dim=1)
             student_z = F.normalize(z1, dim=1)
             consistency_loss = self.consistency_loss_fn(student_z, teacher_z)
 
-        # ===== 图损失（邻接由全局 kNN 图在 batch 裁剪或 fallback 到 batch 内 kNN）=====
+        # ===== 图损失（使用全局 kNN 图的 memory bank 计算，避免 batch 裁剪稀疏性）=====
         graph_smooth = torch.tensor(0.0, device=self.device)
         graph_contrast = torch.tensor(0.0, device=self.device)
         if (self.lambda_graph_smooth > 0 or self.lambda_graph_contrast > 0):
             z1_norm = F.normalize(z1, dim=1)
-            adj_b = None
-            if batch_indices is not None:
-                adj_b = self._build_batch_adj_from_global(batch_indices, device=self.device)
-            if adj_b is None or adj_b.sum() == 0:
-                adj_b = self._build_batch_knn_adj(z1_norm, self.graph_k)
+            # 始终使用 batch 内 kNN 图（全局图仅用于伪标签传播，不用于 batch 损失）
+            adj_b = self._build_batch_knn_adj(z1_norm, self.graph_k)
             if self.lambda_graph_smooth > 0:
                 graph_smooth = self.graph_smooth_loss(z1_norm, adj_b)
             if self.lambda_graph_contrast > 0:
@@ -753,22 +746,25 @@ class SemiSupervisedTrainer(Trainer):
         return np.vstack(all_z)
 
     def _rebuild_global_knn_graph(self):
-        """重建全局 kNN 图（基于投影空间 z 的余弦相似）。"""
+        """重建全局 kNN 图（分块余弦相似，避免 O(N^2) 内存峰值）。"""
         import numpy as np
 
-        self.memory_z = self._extract_all_projected_embeddings()     # [N,D], normalized
+        self.memory_z = self._extract_all_projected_embeddings()  # [N,D], normalized
         N = self.memory_z.shape[0]
-        # 余弦相似 (Z Z^T)
-        sims = self.memory_z @ self.memory_z.T                       # [N,N]
-        np.fill_diagonal(sims, -1.0)                                 # 排除自身
         k = min(self.graph_k, max(1, N - 1))
-        # top-k neighbors
-        knn_idx = np.argpartition(-sims, kth=k-1, axis=1)[:, :k]     # 未排序 top-k
-        # 为稳定起见，可再按相似度排序
-        row_arange = np.arange(N)[:, None]
-        knn_sims = sims[row_arange, knn_idx]
-        order = np.argsort(-knn_sims, axis=1)
-        self.global_knn_indices = knn_idx[row_arange, order]         # [N,k]
+        z = torch.from_numpy(self.memory_z).float()
+
+        chunk = self.config.get('knn_chunk_size', 512)
+        knn_idx = np.empty((N, k), dtype=np.int64)
+
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            sim_block = torch.mm(z[start:end], z.t())  # [chunk, N]
+            sim_block[:, start:end].fill_diagonal_(-1.0)  # 排除自身（对角块）
+            topk = sim_block.topk(k, dim=1).indices.numpy()
+            knn_idx[start:end] = topk
+
+        self.global_knn_indices = knn_idx  # [N, k]
 
     def _build_batch_adj_from_global(self, batch_indices: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
@@ -908,8 +904,7 @@ class SemiSupervisedTrainer(Trainer):
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 list(self.encoder.parameters()) +
-                list(self.projector.parameters()) +
-                [self.prototypes],
+                list(self.projector.parameters()),
                 max_norm=self.config.get('max_grad_norm', 1.0)
             )
             self.scaler.step(self.optimizer)
@@ -918,8 +913,7 @@ class SemiSupervisedTrainer(Trainer):
             loss_dict['total_loss_tensor'].backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.encoder.parameters()) +
-                list(self.projector.parameters()) +
-                [self.prototypes],
+                list(self.projector.parameters()),
                 max_norm=self.config.get('max_grad_norm', 1.0)
             )
             self.optimizer.step()
@@ -1013,16 +1007,7 @@ class SemiSupervisedTrainer(Trainer):
         try:
             for epoch in range(max_epochs):
                 self.current_epoch = epoch
-                # ===== Graph build (每 graph_build_interval 个 epoch) =====
-                if (self.lambda_graph_smooth > 0 or self.lambda_graph_contrast > 0):
-                    if epoch % max(1, self.graph_build_interval) == 0:
-                        try:
-                            self.logger.info(f"Rebuilding global kNN graph (k={self.graph_k}) ...")
-                            self._rebuild_global_knn_graph()
-                            self.logger.info("Global kNN graph built.")
-                        except Exception as e:
-                            self.logger.warning(f"Global graph build failed: {e}")
-                            self.global_knn_indices = None
+                # ===== Graph build 已移至 update_pseudo_labels 内，此处不再重建 =====
 
                 # 在第一个epoch用有标签数据初始化原型
                 if epoch == 0:
@@ -1205,13 +1190,20 @@ class SemiSupervisedTrainer(Trainer):
             epoch=self.current_epoch
         )
         # ====== 图式伪标签传播（LP） + 融合 ======
+        # 全局 kNN 图仅供 LP 使用，在此按 interval 重建
+        try:
+            if self.current_epoch % max(1, self.graph_build_interval) == 0:
+                self._rebuild_global_knn_graph()
+        except Exception as e:
+            self.logger.warning(f"Global graph build failed: {e}")
+            self.global_knn_indices = None
         try:
             glp_labels, glp_conf = graph_label_propagation(
-                projected_embeddings=all_z,   # np.ndarray (N,D)，是你上面 already normalized 的 z_t.cpu().numpy() 也可
+                projected_embeddings=all_z,
                 labels=all_labels,
                 k=self.graph_k,
-                alpha=0.9,
-                iters=20
+                alpha=self.config.get('lp_alpha', 0.9),
+                iters=self.config.get('lp_iters', 20)
             )
             # 融合（阈值可用训练配置或生成器当前阈值）
             thr = float(self.config.get('pseudo_label_threshold', 0.8))

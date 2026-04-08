@@ -13,7 +13,7 @@ from datetime import datetime
 import torch
 
 # 导入项目模块
-from geolife.graph.config.config import Config
+from config.config import Config
 from data.loader import ImprovedGeoLifeDataLoader
 from data.preprocessor import AdvancedTrajectoryPreprocessor
 from data.dataset import TrajDataset, traj_collate_fn
@@ -88,7 +88,6 @@ class TransportModeRecognitionPipeline:
         self.val_dataset = None
         self.encoder = None
         self.projector = None
-        self.learner = None
         self.trainer = None
         self.scaler = None
 
@@ -218,7 +217,7 @@ class TransportModeRecognitionPipeline:
         # 创建数据集
         if self.config.experiment.use_augmentation:
             augmenter = MultiScaleAugmenter()
-            self.train_dataset = TrajDataset(train_trajectories_masked, augment=False, augmenter=augmenter)
+            self.train_dataset = TrajDataset(train_trajectories_masked, augment=True, augmenter=augmenter)
         else:
             self.train_dataset = TrajDataset(train_trajectories_masked, augment=False)
 
@@ -264,22 +263,43 @@ class TransportModeRecognitionPipeline:
             trajectories: List[Dict]
     ) -> Tuple[List[Dict], List[Dict]]:
         """
-        分层划分数据集（保证标签分布）
+        User-disjoint 分层划分：按 user_id 分组后划分，避免用户泄漏。
         """
         from sklearn.model_selection import train_test_split
+        from collections import defaultdict
 
-        labels_array = np.array([t['label'] for t in trajectories])
+        # 按 user_id 分组
+        user_trajs = defaultdict(list)
+        for t in trajectories:
+            uid = t.get('user_id') or t.get('metadata', ).get('user_id', 'unknown')
+            user_trajs[uid].append(t)
 
-        train_indices, val_indices = train_test_split(
-            np.arange(len(trajectories)),
+        user_ids = list(user_trajs.keys())
+
+        # 用每个用户的众数标签做分层依据
+        def user_majority_label(uid):
+            from collections import Counter
+            lbls = [t['label'] for t in user_trajs[uid] if t['label'] is not None]
+            return Counter(lbls).most_common(1)[0][0] if lbls else 0
+
+        user_labels = [user_majority_label(u) for u in user_ids]
+
+        train_users, val_users = train_test_split(
+            user_ids,
             test_size=self.config.data.test_size,
             random_state=self.config.data.random_seed,
-            stratify=labels_array  # 分层划分
+            stratify=user_labels
         )
 
-        train_trajectories = [trajectories[i] for i in train_indices]
-        val_trajectories = [trajectories[i] for i in val_indices]
+        val_set = set(val_users)
+        get_uid = lambda t: t.get('user_id') or t.get('metadata', {}).get('user_id', 'unknown')
+        train_trajectories = [t for t in trajectories if get_uid(t) not in val_set]
+        val_trajectories   = [t for t in trajectories if get_uid(t) in val_set]
 
+        self.logger.info(
+            f"   User-disjoint split: {len(train_users)} train users / "
+            f"{len(val_users)} val users"
+        )
         return train_trajectories, val_trajectories
 
 
@@ -471,33 +491,7 @@ class TransportModeRecognitionPipeline:
         self.logger.info(f"   投影头参数量: {projector_params['total']:,}")
         self.logger.info(f"   总参数量: {total_params:,}")
 
-        # 2.4 创建学习框架
-        if self.config.experiment.use_semi_supervised:
-            self.logger.info("   ✅ 使用半监督学习框架")
-            self.learner = SemiSupervisedPrototypicalLearner(
-                self.encoder,
-                self.projector,
-                num_classes=self.config.experiment.num_classes,
-                temperature=self.config.training.temperature,
-                proto_weight=self.config.training.proto_weight,
-                pseudo_weight=self.config.training.pseudo_weight,
-                consistency_weight=self.config.training.consistency_weight,
-                lr=self.config.training.lr,
-                weight_decay=self.config.training.weight_decay
-            )
-        else:
-            self.logger.info("   ✅ 使用标准原型对比学习")
-            self.learner = PrototypicalContrastiveLearner(
-                self.encoder,
-                self.projector,
-                num_classes=self.config.experiment.num_classes,
-                temperature=self.config.training.temperature,
-                proto_weight=self.config.training.proto_weight,
-                lr=self.config.training.lr,
-                weight_decay=self.config.training.weight_decay
-            )
-
-        return self.encoder, self.projector, self.learner
+        return self.encoder, self.projector
 
     def train(self):
         """步骤3: 训练模型"""
@@ -592,19 +586,33 @@ class TransportModeRecognitionPipeline:
             'dropout': self.config.model.dropout,
             'ema_decay': 0.999,
             'mask_ratio': 0.1,
-            'pseudo_warmup_epochs': 10,
-            'pseudo_ramp_epochs': 50,
-            'consistency_ramp_epochs': 50,
-            'proto_ema': 0.9,
-            'proto_ema_conf_thr': 0.9,
+            'pseudo_warmup_epochs': self.config.training.pseudo_warmup_epochs,
+            'pseudo_ramp_epochs': self.config.training.pseudo_ramp_epochs,
+            'consistency_ramp_epochs': self.config.training.consistency_ramp_epochs,
+            'proto_ema': self.config.training.proto_ema,
+            'proto_ema_conf_thr': self.config.training.proto_ema_conf_thr,
         }
 
         config_dict.update({
             'proto_margin': self.config.training.get('proto_margin', 0.0),
             'class_weights': self.config.training.get('class_weights', None),
             'num_attention_heads': self.config.model.get('num_attention_heads', 8),
-            'encoder_mode': self.config.model.encoder_mode
+            'encoder_mode': self.config.model.encoder_mode,
+            'graph_k': self.config.training.graph_k,
+            'lambda_graph_smooth': self.config.training.lambda_graph_smooth,
+            'lambda_graph_contrast': self.config.training.lambda_graph_contrast,
+            'graph_build_interval': self.config.training.graph_build_interval,
+            'lp_alpha': self.config.training.lp_alpha,
+            'lp_iters': self.config.training.lp_iters,
         })
+
+        # 根据 use_semi_supervised 开关决定是否启用 SSL 组件
+        if not self.config.experiment.use_semi_supervised:
+            config_dict['pseudo_weight'] = 0.0
+            config_dict['consistency_weight'] = 0.0
+            config_dict['lambda_graph_smooth'] = 0.0
+            config_dict['lambda_graph_contrast'] = 0.0
+            self.logger.info("   use_semi_supervised=False: 禁用伪标签/一致性/图损失")
 
         self.trainer = SemiSupervisedTrainer(
             encoder=self.encoder,
@@ -670,24 +678,22 @@ class TransportModeRecognitionPipeline:
                 self.val_full_labels
             ])
 
-        # === 1. 原型最近邻评估 ===
+        # === 1. 原型最近邻评估（仅验证集，避免 train contamination）===
         with Timer("原型分类评估"):
             if prototypes is not None:
-                proto_preds = self._predict_with_prototypes(z_all, prototypes)
+                proto_preds = self._predict_with_prototypes(z_val, prototypes)
 
                 mode_evaluator = TransportModeEvaluator(
                     label_names=self.label_names,
                     save_dir=str(self.exp_dir / 'results')
                 )
-                # 只输出核心指标，并保存 proto_final_summary.json
                 proto_results = mode_evaluator.evaluate(
                     pred_labels=proto_preds,
-                    true_labels=all_true_labels,
+                    true_labels=self.val_full_labels,
                     save_prefix='proto_',
                     return_detailed=False,
                     selected_metrics=['accuracy', 'macro_f1', 'balanced_accuracy']
                 )
-                # 额外打印一行最终指标
                 self.logger.info(
                     "[FINAL] Proto Accuracy: {:.4f} | Macro F1: {:.4f} | BalAcc: {:.4f}".format(
                         proto_results['summary']['accuracy'],
@@ -823,49 +829,75 @@ class TransportModeRecognitionPipeline:
             train_true_labels: np.ndarray,
             prototypes: torch.Tensor
     ) -> Dict:
-        """伪标签质量评估"""
-        # 获取观测标签（含-1）
-        train_observed_labels = np.array([
-            t['label'] for t in train_dataset.trajs
-        ])
+        """伪标签质量评估：使用与训练时完全一致的融合流程（阈值过滤+margin+LP+融合）"""
+        from training.pseudo_label import (
+            AdvancedPseudoLabelGenerator, graph_label_propagation, fuse_pseudo_labels
+        )
+        from sklearn.metrics import accuracy_score, f1_score
 
-        # 找出被隐藏的样本
+        train_observed_labels = np.array([t['label'] for t in train_dataset.trajs])
         unlabeled_mask = train_observed_labels < 0
 
         if unlabeled_mask.sum() == 0:
             return {'message': 'No hidden labels to evaluate'}
 
-        # 用原型预测被隐藏样本的标签
-        z_unlabeled = z_train[unlabeled_mask]
-        pseudo_preds = self._predict_with_prototypes(z_unlabeled, prototypes)
-
-        # 获取真实标签
-        true_unlabeled = train_true_labels[unlabeled_mask]
-
-        # 计算准确率
-        from sklearn.metrics import accuracy_score, f1_score, classification_report
-
-        acc = float(accuracy_score(true_unlabeled, pseudo_preds))
-        macro_f1 = float(f1_score(true_unlabeled, pseudo_preds, average='macro'))
-
-        report = classification_report(
-            true_unlabeled, pseudo_preds,
-            target_names=[self.label_names[i] for i in range(self.config.experiment.num_classes)],
-            output_dict=True
+        # Step1: AdvancedPseudoLabelGenerator（与训练时相同配置）
+        gen = AdvancedPseudoLabelGenerator(
+            confidence_threshold=self.config.training.pseudo_label_threshold,
+            progressive_threshold=True,
+            consistency_check=True,
+            top_k_consistency=3,
+            margin_threshold=0.1,
+        )
+        base_labels, base_conf = gen.generate(
+            projected_embeddings=z_train,
+            labels=train_observed_labels,
+            prototypes=prototypes,
+            epoch=None
         )
 
+        # Step2: graph LP
+        glp_labels, glp_conf = graph_label_propagation(
+            projected_embeddings=z_train,
+            labels=train_observed_labels,
+            k=self.config.training.graph_k,
+            alpha=self.config.training.lp_alpha,
+            iters=self.config.training.lp_iters
+        )
+
+        # Step3: 融合
+        thr = self.config.training.pseudo_label_threshold
+        fused_labels, fused_conf = fuse_pseudo_labels(
+            base_labels, base_conf, glp_labels, glp_conf,
+            observed_labels=train_observed_labels, thr=thr
+        )
+
+        # 只评估被隐藏的样本
+        pseudo_preds = fused_labels[unlabeled_mask]
+        true_unlabeled = train_true_labels[unlabeled_mask]
+
+        # 过滤掉 abstain（-1）的样本
+        accepted = pseudo_preds >= 0
+        abstain_rate = 1.0 - accepted.mean()
+
+        if accepted.sum() == 0:
+            return {'message': 'All pseudo labels abstained', 'abstain_rate': float(abstain_rate)}
+
+        acc = float(accuracy_score(true_unlabeled[accepted], pseudo_preds[accepted]))
+        macro_f1 = float(f1_score(true_unlabeled[accepted], pseudo_preds[accepted], average='macro', zero_division=0))
+
         self.logger.info(
-            f"伪标签质量: "
-            f"隐藏样本={unlabeled_mask.sum()}, "
-            f"准确率={acc:.4f}, "
-            f"Macro F1={macro_f1:.4f}"
+            f"伪标签质量(融合流程): 隐藏={unlabeled_mask.sum()}, "
+            f"采纳={accepted.sum()}({1-abstain_rate:.1%}), "
+            f"准确率={acc:.4f}, Macro F1={macro_f1:.4f}"
         )
 
         return {
             'num_hidden': int(unlabeled_mask.sum()),
+            'num_accepted': int(accepted.sum()),
+            'abstain_rate': float(abstain_rate),
             'accuracy': acc,
             'macro_f1': macro_f1,
-            'report': report
         }
 
     def _extract_embeddings_from_dataset(self, dataset):

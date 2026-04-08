@@ -362,22 +362,25 @@ class CenterLoss(nn.Module):
 
 class GraphSmoothnessLoss(nn.Module):
     """
-    L_graph = Tr(Z^T L Z) / sum(A)
-    其中 L = D - A，为图拉普拉斯矩阵；Z 要求已归一化（更稳定）。
+    归一化图平滑损失：L_graph = Tr(Z^T L_sym Z) / B
+    使用对称归一化拉普拉斯 L_sym = I - D^{-1/2} A D^{-1/2}，
+    特征值范围 [0,2]，与 batch 大小无关，保证非负。
     """
     def __init__(self):
         super().__init__()
 
     def forward(self, z: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        # z: [B, D], adj: [B, B] (float, 对称，非负)
-        deg = adj.sum(dim=1)                    # [B]
-        D = torch.diag(deg)                     # [B,B]
-        L = D - adj                             # Laplacian
-        # Tr(Z^T L Z) = sum_i (zi^T * (L * zi)) = sum_ij L_ij (zi·zj)
-        # 直接用矩阵迹更简洁
-        ztLz = torch.trace(z.t() @ L @ z)
-        denom = adj.sum() + 1e-8
-        return ztLz / denom
+        # z: [B, D] (L2-normalized), adj: [B, B] (float, 对称, 非负)
+        deg = adj.sum(dim=1).clamp(min=1e-8)           # [B]
+        d_inv_sqrt = deg.pow(-0.5)                      # [B]
+        # A_norm = D^{-1/2} A D^{-1/2}
+        A_norm = adj * d_inv_sqrt.unsqueeze(1) * d_inv_sqrt.unsqueeze(0)
+        # L_sym = I - A_norm
+        L_sym = torch.eye(z.size(0), device=z.device) - A_norm
+        # Tr(Z^T L_sym Z) = ||Z||_F^2 - Tr(Z^T A_norm Z)
+        # 等价但更高效：sum_ij A_norm_ij * (zi·zj)
+        ztLz = torch.trace(z.t() @ L_sym @ z)
+        return ztLz.clamp(min=0.0) / z.size(0)
 
 
 class NeighborContrastiveLoss(nn.Module):

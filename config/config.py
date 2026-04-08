@@ -11,7 +11,7 @@ import json
 @dataclass
 class DataConfig:
     """数据配置"""
-    data_root: str = '/autodl-fs/data/251021-mode-recognition/geolife/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data'
+    data_root: str = '/autodl-fs/data/251021-mode-recognition/geolife/graph/Dataset/Geolife Trajectories 1.3/Geolife Trajectories 1.3/Data'
     max_users: int = None
     min_points: int = 20
     max_len: int = 100
@@ -71,6 +71,10 @@ class TrainingConfig:
     lambda_graph_smooth: float = 0.05     # 图拉普拉斯平滑正则权重
     lambda_graph_contrast: float = 0.10   # 邻居对比损失权重
     graph_build_interval: int = 1         # 每多少个 epoch 重建一次全局 kNN 图
+    lp_alpha: float = 0.9                 # 图标签传播平滑系数
+    lp_iters: int = 20                    # 图标签传播迭代次数
+    proto_ema: float = 0.9                # 原型 EMA 更新系数
+    proto_ema_conf_thr: float = 0.9       # 原型 EMA 置信度阈值
 
     proto_margin: float = 0.15  # CosFace 风格 margin
     class_weights: Optional[List[float]] = None  # 新增：按类别顺序的权重，或 None
@@ -91,8 +95,8 @@ class ExperimentConfig:
     num_classes: int = 5
     use_smote: bool = False
     use_augmentation: bool = False
-    use_semi_supervised: bool = False
-    exp_name: str = 'exp_test_0.2_wosemi'
+    use_semi_supervised: bool = True
+    exp_name: str = 'exp_graph_ssl_0.2'
     save_dir: str = './ablation_experiments'
     device: str = 'cuda'
     num_workers: int = 8

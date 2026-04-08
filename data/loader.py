@@ -289,11 +289,11 @@ class ImprovedGeoLifeDataLoader:
                     best_label = label_info['label']
                     best_mode_name = label_info['mode_name']
 
-                # 只有当重叠度超过阈值才认为匹配成功
-                if best_overlap > self.min_overlap:
-                    return best_label, best_mode_name
-                else:
-                    return None, None
+        # 遍历所有区间后，选最大重叠的标签
+        if best_overlap > self.min_overlap:
+            return best_label, best_mode_name
+        else:
+            return None, None
 
     def _print_label_distribution(self, trajectories: List[Dict]):
         """打印标签分布统计（显示合并后的标签）"""

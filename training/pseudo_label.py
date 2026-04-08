@@ -158,17 +158,6 @@ class AdvancedPseudoLabelGenerator:
     def generate_pseudo_labels(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
         
-    def _get_dynamic_threshold(self, epoch: Optional[int]) -> float:
-        """获取动态阈值"""
-        if not self.progressive_threshold or epoch is None:
-            return self.confidence_threshold
-            
-        # 从高阈值逐渐降低（每10个epoch降低0.05）
-        decay = (epoch // 10) * 0.05
-        current_threshold = max(0.5, self.confidence_threshold - decay)
-        
-        return current_threshold
-        
     def _consistency_based_labeling(
         self,
         similarities: torch.Tensor,

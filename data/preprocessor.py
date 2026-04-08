@@ -190,8 +190,8 @@ class AdvancedTrajectoryPreprocessor:
 
         # 空间特征 (26-29) — 本地平面
         if n > 0:
-            range_x = float(xy[:, 0].ptp())
-            range_y = float(xy[:, 1].ptp())
+            range_x = float(np.ptp(xy[:, 0]))
+            range_y = float(np.ptp(xy[:, 1]))
             centroid = xy.mean(axis=0)
             gyration = float(np.sqrt(((xy - centroid) ** 2).sum(axis=1).mean()))
             diag_len = float(np.linalg.norm(xy.max(axis=0) - xy.min(axis=0)))

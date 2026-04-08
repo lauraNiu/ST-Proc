@@ -156,9 +156,6 @@ class TransportModeEvaluator:
                 json.dump(results['summary'], f, indent=4, ensure_ascii=False)
             logger.info(f"   ✅ 核心指标已保存: {summary_path.name}")
 
-        # ==================== 打印结果 ====================
-        self._print_results(results, y_true, y_pred, present_labels)
-
         # ==================== 保存可视化 ====================
         target_names = [self.label_names.get(i, f'class_{i}') for i in present_labels]
 
