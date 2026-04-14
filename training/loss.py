@@ -10,6 +10,51 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+def compute_prototype_logits(
+    embeddings: torch.Tensor,
+    prototypes: torch.Tensor,
+    temperature: float = 0.07,
+    aggregation: str = 'max',
+    pool_temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute class logits for either single-prototype [C, D] or
+    multi-prototype [C, K, D] tensors.
+
+    aggregation:
+    - max: hard nearest prototype
+    - mean: average over class prototypes
+    - logsumexp: soft mixture over class prototypes
+    """
+    z = F.normalize(embeddings, dim=1)
+
+    if prototypes.dim() == 2:
+        p = F.normalize(prototypes, dim=1)
+        return torch.mm(z, p.t()) / temperature
+
+    if prototypes.dim() != 3:
+        raise ValueError(f'Unsupported prototype shape: {tuple(prototypes.shape)}')
+
+    p = F.normalize(prototypes, dim=2)
+    sims = torch.einsum('bd,ckd->bck', z, p)
+    aggregation = str(aggregation).lower()
+
+    if aggregation == 'max':
+        pooled = sims.max(dim=2).values
+    elif aggregation == 'mean':
+        pooled = sims.mean(dim=2)
+    elif aggregation == 'logsumexp':
+        pool_temperature = max(float(pool_temperature), 1e-4)
+        pooled = torch.logsumexp(sims / pool_temperature, dim=2) * pool_temperature
+        pooled = pooled - pool_temperature * torch.log(
+            torch.tensor(sims.size(2), device=sims.device, dtype=sims.dtype)
+        )
+    else:
+        raise ValueError(f'Unknown prototype aggregation: {aggregation}')
+
+    return pooled / temperature
+
+
 class ContrastiveLoss(nn.Module):
     """
     NT-Xent (Normalized Temperature-scaled Cross Entropy) Loss
@@ -88,10 +133,14 @@ class PrototypicalLoss(nn.Module):
     def __init__(self, temperature: float = 0.07,
                  margin: float = 0.0,
                  class_weights=None,
+                 prototype_pooling: str = 'max',
+                 prototype_pool_temperature: float = 1.0,
                  device: str = 'cuda'):
         super().__init__()
         self.temperature = temperature
         self.margin = float(margin)
+        self.prototype_pooling = str(prototype_pooling).lower()
+        self.prototype_pool_temperature = float(prototype_pool_temperature)
         self.device = device
 
         if class_weights is not None:
@@ -101,21 +150,34 @@ class PrototypicalLoss(nn.Module):
                 w = class_weights.float()
             else:
                 raise ValueError("class_weights must be list/tuple/Tensor or None")
-            self.ce_loss = nn.CrossEntropyLoss(weight=w.to(device))
+            self.register_buffer('full_class_weights', w)
         else:
-            self.ce_loss = nn.CrossEntropyLoss()
+            self.full_class_weights = None
+        # ce_loss is built dynamically in forward to handle variable num_classes
+        self.ce_loss = nn.CrossEntropyLoss()
 
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
-        z = F.normalize(embeddings, dim=1)
-        p = F.normalize(prototypes, dim=1)
-        logits = torch.mm(z, p.t()) / self.temperature  # [B,C]
+        logits = compute_prototype_logits(
+            embeddings,
+            prototypes,
+            temperature=self.temperature,
+            aggregation=self.prototype_pooling,
+            pool_temperature=self.prototype_pool_temperature,
+        )
 
         if self.margin > 0.0:
-            # CosFace: 对真实类减 margin
             one_hot = torch.zeros_like(logits).scatter_(1, labels.view(-1, 1), 1.0)
             logits = logits - one_hot * self.margin
 
-        return self.ce_loss(logits, labels)
+        # 动态匹配 class_weights 到当前类别数量
+        if self.full_class_weights is not None:
+            n = logits.shape[1]
+            w = self.full_class_weights[:n].to(embeddings.device)
+            loss_fn = nn.CrossEntropyLoss(weight=w)
+        else:
+            loss_fn = self.ce_loss
+
+        return loss_fn(logits, labels)
 
 
 class ConsistencyLoss(nn.Module):
@@ -399,7 +461,7 @@ class NeighborContrastiveLoss(nn.Module):
         B = z.size(0)
         sim = torch.matmul(z, z.t()) / self.t                    # [B,B]
         mask_self = torch.eye(B, device=z.device).bool()
-        sim = sim.masked_fill(mask_self, -1e9)                   # 去掉自身
+        sim = sim.masked_fill(mask_self, -1e4)                   # 去掉自身
 
         # 正例掩码（邻居）
         pos_mask = (adj > 0).float()                             # [B,B]

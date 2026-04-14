@@ -370,7 +370,28 @@ class UnifiedVisualizer:
 
     def plot_metrics(self, metrics: Dict[str, List[float]],
                     filename: str = 'metrics_trends.png'):
-        """Plot evaluation metrics trends"""
+        """Plot evaluation metrics trends.
+
+        Supports either:
+        1. dict[str, list[float]]  -> already grouped by metric name
+        2. list[dict[str, float]]  -> one dict per epoch
+        """
+        if isinstance(metrics, list):
+            if len(metrics) == 0:
+                return None
+
+            metric_dict = {}
+            for epoch_metrics in metrics:
+                if not isinstance(epoch_metrics, dict):
+                    continue
+                for metric_name, value in epoch_metrics.items():
+                    if isinstance(value, (int, float, np.integer, np.floating)):
+                        metric_dict.setdefault(metric_name, []).append(float(value))
+            metrics = metric_dict
+
+        if not isinstance(metrics, dict) or len(metrics) == 0:
+            return None
+
         n_metrics = len(metrics)
         n_cols = min(2, n_metrics)
         n_rows = (n_metrics + n_cols - 1) // n_cols

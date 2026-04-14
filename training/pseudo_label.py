@@ -4,16 +4,34 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, List
 from collections import defaultdict
 import logging
+from .loss import compute_prototype_logits
 
 
 logger = logging.getLogger(__name__)
+
+PSEUDO_SOURCE_ABSTAIN = 0
+PSEUDO_SOURCE_OBSERVED = 1
+PSEUDO_SOURCE_AGREE = 2
+PSEUDO_SOURCE_BASE_ONLY = 3
+PSEUDO_SOURCE_LP_ONLY = 4
+PSEUDO_SOURCE_BASE_CONFLICT = 5
+PSEUDO_SOURCE_LP_CONFLICT = 6
 
 
 class PseudoLabelGenerator:
     """基础伪标签生成器 - 高置信度策略"""
 
-    def __init__(self, confidence_threshold: float = 0.85):
+    def __init__(
+        self,
+        confidence_threshold: float = 0.85,
+        pseudo_temperature: float = 0.30,
+        prototype_pooling: str = 'max',
+        prototype_pool_temperature: float = 1.0,
+    ):
         self.confidence_threshold = confidence_threshold
+        self.pseudo_temperature = float(pseudo_temperature)
+        self.prototype_pooling = str(prototype_pooling).lower()
+        self.prototype_pool_temperature = float(prototype_pool_temperature)
 
     def generate(
         self,
@@ -45,11 +63,15 @@ class PseudoLabelGenerator:
             return labels, all_confidences
 
         z_u = torch.from_numpy(projected_embeddings[unlabeled_mask]).float().to(device)
-        z_u = F.normalize(z_u, dim=1)
-        protos = F.normalize(prototypes, dim=1)
-
-        sims = z_u @ protos.t()  # 余弦相似度
-        confs, preds = sims.max(dim=1)
+        logits = compute_prototype_logits(
+            z_u,
+            prototypes,
+            temperature=self.pseudo_temperature,
+            aggregation=self.prototype_pooling,
+            pool_temperature=self.prototype_pool_temperature,
+        )
+        probs = F.softmax(logits, dim=1)  # 转为概率，与阈值量纲一致
+        confs, preds = probs.max(dim=1)
 
         high_mask = confs > self.confidence_threshold
         new_labels = labels.copy()
@@ -67,7 +89,7 @@ class PseudoLabelGenerator:
 
 
 class AdvancedPseudoLabelGenerator:
-    """伪标签生成器：支持 per-class 阈值/ margin，一致性检查，可渐进阈值"""
+    """伪标签生成器：支持 per-class 阈值/ margin，一致性检查，可渐进阈值，teacher classifier 融合"""
     def __init__(self,
                  confidence_threshold: float = 0.85,
                  progressive_threshold: bool = True,
@@ -75,7 +97,25 @@ class AdvancedPseudoLabelGenerator:
                  top_k_consistency: int = 3,
                  margin_threshold: float = 0.1,
                  per_class_thresholds: Optional[Dict[int, float]] = None,
-                 per_class_margin: Optional[Dict[int, float]] = None):
+                 per_class_margin: Optional[Dict[int, float]] = None,
+                 pseudo_temperature: float = 0.30,
+                 min_threshold: float = 0.65,
+                 threshold_decay: float = 0.02,
+                 threshold_decay_interval: int = 10,
+                 low_margin_penalty: float = 0.90,
+                 teacher_clf_weight: float = 0.0,
+                 proto_weight: float = 1.0,
+                 prototype_pooling: str = 'max',
+                 prototype_pool_temperature: float = 1.0,
+                 confidence_floor: float = 0.0,
+                 distribution_alignment: bool = False,
+                 distribution_momentum: float = 0.90,
+                 distribution_min_prob: float = 1e-3,
+                 teacher_temperature: float = 1.0,
+                 proto_temperature: float = 1.0,
+                 reliability_gate: bool = False,
+                 reliability_power: float = 1.0,
+                 reliability_floor: float = 0.35):
         self.confidence_threshold = confidence_threshold
         self.progressive_threshold = progressive_threshold
         self.consistency_check = consistency_check
@@ -83,19 +123,79 @@ class AdvancedPseudoLabelGenerator:
         self.margin_threshold = margin_threshold
         self.per_class_thr = per_class_thresholds or {}
         self.per_class_margin = per_class_margin or {}
+        self.pseudo_temperature = float(pseudo_temperature)
+        self.min_threshold = float(min_threshold)
+        self.threshold_decay = float(threshold_decay)
+        self.threshold_decay_interval = max(1, int(threshold_decay_interval))
+        self.low_margin_penalty = float(low_margin_penalty)
+        self.teacher_clf_weight = float(teacher_clf_weight)
+        self.proto_weight = float(proto_weight)
+        self.prototype_pooling = str(prototype_pooling).lower()
+        self.prototype_pool_temperature = float(prototype_pool_temperature)
+        self.confidence_floor = float(confidence_floor)
+        self.distribution_alignment = bool(distribution_alignment)
+        self.distribution_momentum = float(distribution_momentum)
+        self.distribution_min_prob = float(distribution_min_prob)
+        self.teacher_temperature = max(1e-4, float(teacher_temperature))
+        self.proto_temperature = max(1e-4, float(proto_temperature))
+        self.reliability_gate = bool(reliability_gate)
+        self.reliability_power = max(0.0, float(reliability_power))
+        self.reliability_floor = float(reliability_floor)
+        self.target_distribution: Optional[np.ndarray] = None
+        self.unlabeled_prior_ema: Optional[torch.Tensor] = None
+        self.class_reliability: Dict[int, float] = {}
         self.history: List[Dict] = []
 
     def _get_dynamic_threshold(self, epoch: Optional[int]) -> float:
         if not self.progressive_threshold or epoch is None:
             return self.confidence_threshold
-        decay = (epoch // 10) * 0.05
-        return max(0.5, self.confidence_threshold - decay)
+        steps = max(0, int(epoch) // self.threshold_decay_interval)
+        decay = steps * self.threshold_decay
+        return max(self.min_threshold, self.confidence_threshold - decay)
+
+    def _apply_distribution_alignment(self, probs: torch.Tensor) -> torch.Tensor:
+        if not self.distribution_alignment or probs.numel() == 0:
+            return probs
+        batch_prior = probs.mean(dim=0)
+        if self.unlabeled_prior_ema is None or self.unlabeled_prior_ema.numel() != batch_prior.numel():
+            self.unlabeled_prior_ema = batch_prior.detach()
+        else:
+            self.unlabeled_prior_ema = (
+                self.distribution_momentum * self.unlabeled_prior_ema
+                + (1.0 - self.distribution_momentum) * batch_prior.detach()
+            )
+        if self.target_distribution is None:
+            return probs
+        target = torch.as_tensor(self.target_distribution, dtype=probs.dtype, device=probs.device)
+        if target.numel() != probs.size(1):
+            return probs
+        target = target.clamp_min(self.distribution_min_prob)
+        model_prior = self.unlabeled_prior_ema.to(probs.device).clamp_min(self.distribution_min_prob)
+        aligned = probs * (target / model_prior).unsqueeze(0)
+        aligned = aligned / aligned.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return aligned
+
+    def _apply_reliability_gate(self, conf: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        if not self.reliability_gate or conf.numel() == 0:
+            return conf
+        if not self.class_reliability:
+            return conf
+        reliability = torch.ones_like(conf)
+        for cls, quality in self.class_reliability.items():
+            mask = pred == int(cls)
+            if mask.any():
+                q = max(self.reliability_floor, min(1.0, float(quality)))
+                reliability[mask] = q
+        if self.reliability_power <= 0.0:
+            return conf
+        return conf * torch.pow(reliability, self.reliability_power)
 
     def generate(self,
                  projected_embeddings: np.ndarray,
                  labels: np.ndarray,
                  prototypes: torch.Tensor,
-                 epoch: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+                 epoch: Optional[int] = None,
+                 teacher_clf_logits: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         if isinstance(labels, torch.Tensor):
             labels = labels.cpu().numpy()
 
@@ -109,34 +209,54 @@ class AdvancedPseudoLabelGenerator:
             return labels, all_conf
 
         z_u = torch.from_numpy(projected_embeddings[unlabeled_mask]).float().to(device)
-        z_u = F.normalize(z_u, dim=1)
-        protos = F.normalize(prototypes, dim=1)
-        sims = z_u @ protos.t()  # [Nu, C]
+        logits = compute_prototype_logits(
+            z_u,
+            prototypes,
+            temperature=self.pseudo_temperature,
+            aggregation=self.prototype_pooling,
+            pool_temperature=self.prototype_pool_temperature,
+        )
+        proto_probs = F.softmax(logits / self.proto_temperature, dim=1)
 
-        # Top-K / margin
-        top_vals, top_idx = sims.topk(self.top_k, dim=1)
+        if teacher_clf_logits is not None and self.teacher_clf_weight > 0.0:
+            clf_logits_u = torch.from_numpy(teacher_clf_logits[unlabeled_mask]).float().to(device)
+            clf_probs = F.softmax(clf_logits_u / self.teacher_temperature, dim=1)
+            w_clf = self.teacher_clf_weight
+            w_proto = self.proto_weight
+            total_w = w_clf + w_proto
+            probs = (w_clf * clf_probs + w_proto * proto_probs) / max(total_w, 1e-8)
+        else:
+            probs = proto_probs
+
+        probs = self._apply_distribution_alignment(probs)
+
+        top_k = min(self.top_k, probs.shape[1])
+        top_vals, top_idx = probs.topk(top_k, dim=1)
         pred = top_idx[:, 0]
         conf = top_vals[:, 0]
-        margin = top_vals[:, 0] - top_vals[:, 1] if self.top_k > 1 else torch.ones_like(conf)
+        margin = top_vals[:, 0] - top_vals[:, 1] if top_k > 1 else torch.ones_like(conf)
 
-        # per-class 阈值/ margin 应用
         base_thr = self._get_dynamic_threshold(epoch)
         class_thr = torch.full_like(conf, fill_value=base_thr)
         class_mar = torch.full_like(conf, fill_value=self.margin_threshold)
         for c, t in self.per_class_thr.items():
             m = (pred == int(c))
             if m.any():
-                class_thr[m] = torch.clamp(torch.tensor(t, device=conf.device), min=0.0, max=0.999)
+                class_thr[m] = torch.clamp(
+                    torch.tensor(t, device=conf.device, dtype=conf.dtype),
+                    min=0.0,
+                    max=0.999,
+                )
         for c, mval in self.per_class_margin.items():
             m = (pred == int(c))
             if m.any():
-                class_mar[m] = torch.tensor(mval, device=conf.device)
+                class_mar[m] = torch.tensor(mval, device=conf.device, dtype=conf.dtype)
 
-        # 一致性检查：低 margin 降权
-        if self.consistency_check and self.top_k > 1:
-            conf = torch.where(margin > class_mar, conf, conf * 0.8)
+        if self.consistency_check and top_k > 1 and 0.0 < self.low_margin_penalty < 1.0:
+            conf = torch.where(margin > class_mar, conf, conf * self.low_margin_penalty)
 
-        # 统计
+        conf = self._apply_reliability_gate(conf, pred)
+
         self.history.append({
             'epoch': int(epoch) if epoch is not None else None,
             'base_threshold': float(base_thr),
@@ -146,18 +266,22 @@ class AdvancedPseudoLabelGenerator:
 
         new_labels = labels.copy()
         u_idx = np.where(unlabeled_mask)[0]
+        if self.confidence_floor > 0.0:
+            conf = torch.where(conf >= self.confidence_floor, conf, torch.zeros_like(conf))
         conf_np = conf.detach().cpu().numpy()
         mar_np = margin.detach().cpu().numpy() if self.top_k > 1 else np.ones_like(conf_np)
-        # 逐样本采纳（需同时满足阈值和 margin）
-        for j, (cval, mval, pr) in enumerate(zip(conf_np, mar_np, pred.detach().cpu().numpy())):
-            if cval >= class_thr[j].item() and (self.top_k == 1 or mval >= class_mar[j].item()):
+        pred_np = pred.detach().cpu().numpy()
+        class_thr_np = class_thr.detach().cpu().numpy()
+        class_mar_np = class_mar.detach().cpu().numpy()
+        for j, (cval, mval, pr) in enumerate(zip(conf_np, mar_np, pred_np)):
+            if cval >= class_thr_np[j] and (top_k == 1 or mval >= class_mar_np[j]):
                 new_labels[u_idx[j]] = int(pr)
         all_conf[u_idx] = conf_np
         return new_labels, all_conf
 
     def generate_pseudo_labels(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
-        
+
     def _consistency_based_labeling(
         self,
         similarities: torch.Tensor,
@@ -186,10 +310,11 @@ class AdvancedPseudoLabelGenerator:
         pseudo_labels = top_k_indices[:, 0]
         
         # 降低低margin样本的置信度
+        penalty = self.low_margin_penalty if 0.0 < self.low_margin_penalty < 1.0 else 1.0
         confidences = torch.where(
             high_margin_mask,
             confidences,
-            confidences * 0.8
+            confidences * penalty
         )
         
         return pseudo_labels, confidences
@@ -513,7 +638,10 @@ def graph_label_propagation(
     labels: np.ndarray,
     k: int = 10,
     alpha: float = 0.9,
-    iters: int = 20
+    iters: int = 20,
+    min_support: float = 0.0,
+    conf_power: float = 0.75,
+    min_purity: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     简单 LP：Y <- alpha * S * Y + (1-alpha) * Y0
@@ -522,27 +650,23 @@ def graph_label_propagation(
     返回：(pred_labels, confidences)
     """
     z = torch.from_numpy(projected_embeddings).float()
-    z = F.normalize(z, dim=1)       # 归一化
-    N, D = z.shape
+    z = F.normalize(z, dim=1)
+    N, _ = z.shape
 
-    # 余弦相似构图，取 kNN
-    sim = torch.mm(z, z.t())        # [N,N]
+    sim = torch.mm(z, z.t())
     sim.fill_diagonal_(0.0)
 
-    # kNN 稀疏邻接
-    topk = sim.topk(k, dim=1).indices     # [N,k]
+    k = max(1, min(int(k), max(1, N - 1)))
+    topk = sim.topk(k, dim=1).indices
     adj = torch.zeros_like(sim)
     adj.scatter_(1, topk, sim.gather(1, topk))
     adj = torch.max(adj, adj.t())
 
-    # 行归一化 S
     row_sum = adj.sum(dim=1, keepdim=True) + 1e-8
     S = adj / row_sum
 
-    # Y0 (one-hot for labeled)
     C = int(labels[labels >= 0].max() + 1) if (labels >= 0).any() else 0
     if C == 0:
-        # 无标签则返回全 -1
         return np.full(N, -1, dtype=np.int64), np.zeros(N, dtype=np.float32)
 
     Y0 = torch.zeros(N, C)
@@ -550,13 +674,144 @@ def graph_label_propagation(
     if len(labeled_idx) > 0:
         Y0[labeled_idx, labels[labeled_idx]] = 1.0
 
-    # 迭代传播
     Y = Y0.clone()
     for _ in range(iters):
         Y = alpha * (S @ Y) + (1 - alpha) * Y0
 
-    conf, pred = Y.max(dim=1)
+    support = torch.clamp(Y.sum(dim=1), min=0.0, max=1.0)
+    probs = Y / Y.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    purity_conf, pred = probs.max(dim=1)
+    support_conf = torch.pow(support, max(1e-4, float(conf_power)))
+    conf = 0.7 * purity_conf + 0.3 * support_conf
+
+    unlabeled_mask = torch.from_numpy(labels < 0)
+    if min_support > 0:
+        low_support = unlabeled_mask & (support < float(min_support))
+        conf = conf.masked_fill(low_support, 0.0)
+        pred = pred.masked_fill(low_support, -1)
+    if min_purity > 0:
+        low_purity = unlabeled_mask & (purity_conf < float(min_purity))
+        conf = conf.masked_fill(low_purity, 0.0)
+        pred = pred.masked_fill(low_purity, -1)
+
     return pred.numpy().astype(np.int64), conf.numpy().astype(np.float32)
+
+
+def apply_pseudo_label_acceptance_cap(
+    labels: np.ndarray,
+    confidences: np.ndarray,
+    observed_labels: np.ndarray,
+    max_rate: float = 1.0,
+    max_count: int = 0,
+    class_balance: bool = False,
+    class_balance_power: float = 0.5,
+    min_per_class: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Cap pseudo-label adoption to avoid late-stage confirmation-bias cascades."""
+    capped_labels = labels.copy()
+    capped_conf = confidences.copy()
+
+    unlabeled_mask = observed_labels < 0
+    accepted_idx = np.where((capped_labels >= 0) & unlabeled_mask)[0]
+    before = int(len(accepted_idx))
+    total_unlabeled = int(unlabeled_mask.sum())
+
+    if before == 0:
+        return capped_labels, capped_conf, {
+            'before': 0,
+            'after': 0,
+            'dropped': 0,
+            'cap': 0,
+            'total_unlabeled': total_unlabeled,
+        }
+
+    cap = before
+    if max_rate is not None and 0.0 < float(max_rate) < 1.0:
+        cap = min(cap, max(1, int(total_unlabeled * float(max_rate))))
+    if max_count is not None and int(max_count) > 0:
+        cap = min(cap, int(max_count))
+
+    if cap < before:
+        if class_balance:
+            observed_known = observed_labels[observed_labels >= 0]
+            obs_counts = np.bincount(observed_known.astype(np.int64)) if len(observed_known) > 0 else np.array([], dtype=np.int64)
+            keep_idx = []
+            remaining_slots = cap
+            by_class = {}
+            class_weights = {}
+            for c in np.unique(capped_labels[accepted_idx]):
+                cls_idx = accepted_idx[capped_labels[accepted_idx] == c]
+                cls_idx = cls_idx[np.argsort(-capped_conf[cls_idx])]
+                by_class[int(c)] = cls_idx
+                obs_count = int(obs_counts[int(c)]) if int(c) < len(obs_counts) else 0
+                class_weights[int(c)] = 1.0 / max(obs_count, 1) ** float(class_balance_power)
+            total_weight = sum(class_weights.values()) if class_weights else 0.0
+            quotas = {}
+            if total_weight > 0.0:
+                for c, cls_idx in by_class.items():
+                    target = int(round(cap * class_weights[c] / total_weight))
+                    if min_per_class > 0:
+                        target = max(min_per_class, target)
+                    quotas[c] = min(len(cls_idx), target)
+            else:
+                quotas = {c: min(len(cls_idx), min_per_class if min_per_class > 0 else len(cls_idx)) for c, cls_idx in by_class.items()}
+            for c, cls_idx in by_class.items():
+                take = min(len(cls_idx), quotas.get(c, 0), remaining_slots)
+                if take > 0:
+                    keep_idx.extend(cls_idx[:take].tolist())
+                    remaining_slots -= take
+            if remaining_slots > 0:
+                residual = np.setdiff1d(accepted_idx, np.array(keep_idx, dtype=np.int64), assume_unique=False)
+                residual = residual[np.argsort(-capped_conf[residual])]
+                keep_idx.extend(residual[:remaining_slots].tolist())
+            keep_idx = np.array(sorted(set(keep_idx)), dtype=np.int64)
+            drop_idx = np.setdiff1d(accepted_idx, keep_idx, assume_unique=False)
+        else:
+            order = accepted_idx[np.argsort(-capped_conf[accepted_idx])]
+            drop_idx = order[cap:]
+        capped_labels[drop_idx] = -1
+        capped_conf[drop_idx] = 0.0
+
+    after = int(((capped_labels >= 0) & unlabeled_mask).sum())
+    return capped_labels, capped_conf, {
+        'before': before,
+        'after': after,
+        'dropped': before - after,
+        'cap': int(cap),
+        'total_unlabeled': total_unlabeled,
+    }
+
+
+def class_balanced_pseudo_cap(
+    labels: np.ndarray,
+    confidences: np.ndarray,
+    observed_labels: np.ndarray,
+    quota_per_class: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """对每个类别独立按置信度排序，各取 top-quota 个高置信样本。
+    quota_per_class <= 0 时直接返回原始结果（不限制）。
+    """
+    if quota_per_class <= 0:
+        return labels.copy(), confidences.copy()
+
+    capped_labels = labels.copy()
+    capped_conf = confidences.copy()
+    unlabeled_mask = observed_labels < 0
+
+    classes = np.unique(labels[(labels >= 0) & unlabeled_mask])
+    for c in classes:
+        cls_mask = (labels == int(c)) & unlabeled_mask
+        cls_idx = np.where(cls_mask)[0]
+        if len(cls_idx) <= quota_per_class:
+            continue
+        # 按置信度降序，保留 top-quota，其余 abstain
+        order = cls_idx[np.argsort(-confidences[cls_idx])]
+        drop_idx = order[quota_per_class:]
+        capped_labels[drop_idx] = -1
+        capped_conf[drop_idx] = 0.0
+
+    return capped_labels, capped_conf
+
 
 
 def fuse_pseudo_labels(
@@ -565,43 +820,77 @@ def fuse_pseudo_labels(
     glp_labels: np.ndarray,
     glp_conf: np.ndarray,
     observed_labels: np.ndarray,
-    thr: float = 0.6
+    thr: float = 0.6,
+    lp_thr: Optional[float] = None,
+    conflict_thr: Optional[float] = None,
+    conflict_margin: float = 0.10,
+    allow_lp_only: bool = True,
+    lp_agree_bonus: float = 0.0,
+    lp_agree_threshold_offset: float = 0.03,
+    return_sources: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     融合高级伪标签生成器与图传播标签：
-    - 若两者一致且 max(conf) >= thr，则采纳；conf 取最大或平均都可（此处取最大）。
-    - 若不一致，选择置信度更高且 >= thr 的那个；否则保持 -1。
-    - 对已有真实标签的样本，保持真实标签，置信度=1.0。
+    - agreement 时允许略低于 base 主阈值，给图一致性一个可验证的入口。
+    - LP-only 分支默认更严格，必要时可直接关闭。
+    - 双方冲突时默认 abstain，只有一方显著更强才放行。
     """
+    agree_thr = max(0.50, float(thr) - max(0.0, float(lp_agree_threshold_offset)))
+    agree_min_side = max(0.45, agree_thr - 0.08)
+    base_thr = float(thr)
+    lp_thr = max(float(lp_thr) if lp_thr is not None else 0.0, min(0.99, float(thr) + 0.08))
+    conflict_thr = max(float(conflict_thr) if conflict_thr is not None else 0.0, min(0.99, float(thr) + 0.15))
+    conflict_margin = max(0.10, float(conflict_margin))
+
     N = len(base_labels)
     fused_labels = -1 * np.ones(N, dtype=np.int64)
     fused_conf = np.zeros(N, dtype=np.float32)
+    fused_sources = np.full(N, PSEUDO_SOURCE_ABSTAIN, dtype=np.int64)
 
-    # 先保留真实标签
     labeled_mask = observed_labels >= 0
     fused_labels[labeled_mask] = observed_labels[labeled_mask]
     fused_conf[labeled_mask] = 1.0
+    fused_sources[labeled_mask] = PSEUDO_SOURCE_OBSERVED
 
-    # 仅在未标注位置融合
     U = np.where(~labeled_mask)[0]
     for i in U:
-        bl, bc = base_labels[i], float(base_conf[i])
-        gl, gc = glp_labels[i], float(glp_conf[i])
+        bl, bc = int(base_labels[i]), float(base_conf[i])
+        gl, gc = int(glp_labels[i]), float(glp_conf[i])
 
-        # 都预测了同一类
-        if bl >= 0 and gl >= 0 and bl == gl and max(bc, gc) >= thr:
+        if bl >= 0 and gl >= 0 and bl == gl:
+            agree_conf = min(0.999, max(bc, gc) + max(0.0, float(lp_agree_bonus)))
+            if agree_conf >= agree_thr and min(bc, gc) >= agree_min_side:
+                fused_labels[i] = bl
+                fused_conf[i] = agree_conf
+                fused_sources[i] = PSEUDO_SOURCE_AGREE
+                continue
+
+        if bl >= 0 and gl < 0 and bc >= base_thr:
             fused_labels[i] = bl
-            fused_conf[i] = max(bc, gc)
-        else:
-            # 选择更高置信度的那个（需 >= thr）
-            if bl >= 0 and bc >= thr and (bc >= gc):
+            fused_conf[i] = bc
+            fused_sources[i] = PSEUDO_SOURCE_BASE_ONLY
+            continue
+
+        if allow_lp_only and gl >= 0 and bl < 0 and gc >= lp_thr:
+            fused_labels[i] = gl
+            fused_conf[i] = gc
+            fused_sources[i] = PSEUDO_SOURCE_LP_ONLY
+            continue
+
+        if bl >= 0 and gl >= 0 and bl != gl:
+            if bc >= conflict_thr and (bc - gc) >= conflict_margin:
                 fused_labels[i] = bl
                 fused_conf[i] = bc
-            elif gl >= 0 and gc >= thr:
+                fused_sources[i] = PSEUDO_SOURCE_BASE_CONFLICT
+            elif allow_lp_only and gc >= max(conflict_thr, lp_thr) and (gc - bc) >= conflict_margin:
                 fused_labels[i] = gl
                 fused_conf[i] = gc
+                fused_sources[i] = PSEUDO_SOURCE_LP_CONFLICT
             else:
                 fused_labels[i] = -1
                 fused_conf[i] = 0.0
+                fused_sources[i] = PSEUDO_SOURCE_ABSTAIN
 
+    if return_sources:
+        return fused_labels, fused_conf, fused_sources
     return fused_labels, fused_conf

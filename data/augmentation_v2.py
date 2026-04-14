@@ -28,10 +28,12 @@ class CoordinateAwareAugmenter:
         coords = coords.copy()
         valid_coords = coords[:valid_length]
 
-        # 1. 添加相对噪声
+        # 1. 对 xy 通道添加相对噪声；速度通道加更小的噪声（保护绝对速度信息）
         if np.random.rand() > 0.5:
-            noise = np.random.normal(0, self.noise_scale, valid_coords.shape)
-            valid_coords += noise
+            noise = np.zeros_like(valid_coords)
+            noise[:, :2] = np.random.normal(0, self.noise_scale, (len(valid_coords), 2))
+            noise[:, 2:] = np.random.normal(0, self.noise_scale * 0.1, (len(valid_coords), valid_coords.shape[1] - 2))
+            valid_coords = valid_coords + noise
 
         # 2. 随机掩码（用邻近点插值，而非0）
         if np.random.rand() > 0.5:
@@ -47,17 +49,17 @@ class CoordinateAwareAugmenter:
                 elif idx == valid_length - 1 and valid_length > 1:
                     valid_coords[idx] = valid_coords[idx - 1]
 
-        # 3. 小角度旋转
+        # 3. 小角度旋转（仅对 xy 坐标，不影响速度通道）
         if np.random.rand() > 0.7:
-            center = valid_coords.mean(axis=0)
-            coords_centered = valid_coords - center
             angle = np.random.uniform(-self.rotate_angle, self.rotate_angle)
             rotation_matrix = np.array([
                 [np.cos(angle), -np.sin(angle)],
                 [np.sin(angle), np.cos(angle)]
             ])
-            coords_rotated = coords_centered @ rotation_matrix.T
-            valid_coords = coords_rotated + center
+            center_xy = valid_coords[:, :2].mean(axis=0)
+            coords_rotated = valid_coords.copy()
+            coords_rotated[:, :2] = (valid_coords[:, :2] - center_xy) @ rotation_matrix.T + center_xy
+            valid_coords = coords_rotated
 
         coords[:valid_length] = valid_coords
         return coords

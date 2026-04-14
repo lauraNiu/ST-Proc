@@ -5,6 +5,27 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ClassifierHead(nn.Module):
+    """
+    标准分类头：直接在编码器输出 h 上做 cross-entropy 分类。
+    推理时优先使用，比 prototype nearest-neighbor 更稳定。
+    """
+    def __init__(self, input_dim: int = 256, num_classes: int = 5, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, num_classes)
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: [B, input_dim] -> logits: [B, num_classes]"""
+        return self.net(h)
 
 
 class ProjectionHead(nn.Module):

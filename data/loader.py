@@ -101,15 +101,18 @@ class ImprovedGeoLifeDataLoader:
 
             trajectories.extend(user_trajs)
 
-        # 二次过滤：确保没有 label=-1 的轨迹
-        original_count = len(trajectories)
-        trajectories = [t for t in trajectories if t['label'] is not None and t['label'] >= 0]
-        excluded_count = original_count - len(trajectories)
+        if require_valid_label:
+            original_count = len(trajectories)
+            trajectories = [t for t in trajectories if t['label'] is not None and t['label'] >= 0]
+            excluded_count = original_count - len(trajectories)
 
-        if excluded_count > 0:
-            print(f"⚠️  二次过滤排除了 {excluded_count} 条无效标签轨迹")
+            if excluded_count > 0:
+                print(f"⚠️  二次过滤排除了 {excluded_count} 条无效标签轨迹")
 
-        print(f"✅ 成功加载 {len(trajectories)} 条有效轨迹")
+            print(f"✅ 成功加载 {len(trajectories)} 条有效轨迹")
+        else:
+            print(f"✅ 成功加载 {len(trajectories)} 条轨迹（含无标签轨迹）")
+
         print(f"📊 总加载: {total_loaded}, 最终保留: {len(trajectories)}")
 
         # 统计标签分布
@@ -181,15 +184,13 @@ class ImprovedGeoLifeDataLoader:
                 if require_valid_label and (label is None or label < 0):
                     continue  # 跳过无标签或无效标签的轨迹
 
-                # 只有当有有效标签时才添加
-                if label is not None and label >= 0:
-                    trajectories.append({
-                        'user_id': user_id,
-                        'trajectory_id': plt_file.replace('.plt', ''),
-                        'data': df[['latitude', 'longitude', 'timestamp', 'datetime']],
-                        'label': label,
-                        'mode_name': mode_name
-                    })
+                trajectories.append({
+                    'user_id': user_id,
+                    'trajectory_id': plt_file.replace('.plt', ''),
+                    'data': df[['latitude', 'longitude', 'timestamp', 'datetime']],
+                    'label': label if label is not None and label >= 0 else -1,
+                    'mode_name': mode_name
+                })
 
             except Exception as e:
                 # 静默忽略损坏的文件

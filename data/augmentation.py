@@ -73,7 +73,7 @@ class TrajectoryAugmenter:
         return out
 
     def _random_rotation(self, coords: np.ndarray) -> np.ndarray:
-        """随机旋转"""
+        """随机旋转（仅对前两维 lat/lon 旋转）"""
         center = coords.mean(axis=0)
         coords_centered = coords - center
         angle = np.random.uniform(-self.rotate_angle, self.rotate_angle)
@@ -81,8 +81,9 @@ class TrajectoryAugmenter:
             [np.cos(angle), -np.sin(angle)],
             [np.sin(angle), np.cos(angle)]
         ])
-        coords_rotated = coords_centered @ rotation_matrix.T
-        return coords_rotated + center
+        result = coords_centered.copy()
+        result[:, :2] = coords_centered[:, :2] @ rotation_matrix.T
+        return result + center
 
 
 class MultiScaleAugmenter(TrajectoryAugmenter):
@@ -136,7 +137,7 @@ class MultiScaleAugmenter(TrajectoryAugmenter):
         for i in range(max(0, center_idx - radius), min(length, center_idx + radius)):
             distance = abs(i - center_idx)
             distortion_strength = (1 - distance / radius) * 0.001
-            distorted[i] += np.random.normal(0, distortion_strength, 2)
+            distorted[i] += np.random.normal(0, distortion_strength, coords.shape[1])
 
         return distorted
 
@@ -153,7 +154,7 @@ class MultiScaleAugmenter(TrajectoryAugmenter):
         ])
 
         scale = np.random.uniform(0.9, 1.1)
-        coords_centered[:length] = (coords_centered[:length] @ rotation.T) * scale
+        coords_centered[:length, :2] = (coords_centered[:length, :2] @ rotation.T) * scale
         coords_centered[:length] += center
 
         return coords_centered
