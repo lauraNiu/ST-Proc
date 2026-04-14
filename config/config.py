@@ -119,6 +119,11 @@ class TrainingConfig:
     pseudo_lp_agree_threshold_offset: float = 0.03
     pseudo_lp_conf_power: float = 0.75
     pseudo_lp_min_purity: float = 0.65
+    lp_graph_temperature: float = 0.20
+    lp_mutual_knn: bool = True
+    lp_seed_weight: float = 0.35
+    lp_entropy_weight: float = 0.20
+    lp_neighbor_agreement_weight: float = 0.25
 
     low_ratio_cutoff: float = 0.10
     mid_ratio_cutoff: float = 0.30
@@ -133,6 +138,10 @@ class TrainingConfig:
     low_ratio_hard_negative_weight_scale: float = 0.35
     low_ratio_coarse_aux_weight_scale: float = 0.50
     low_ratio_aux_ramp_epochs: int = 35
+    mid_ratio_initial_pseudo_max_adoption_rate: float = 0.15
+    mid_ratio_target_pseudo_max_adoption_rate: float = 0.20
+    mid_ratio_pseudo_warmup_epochs: int = 10
+    mid_ratio_pseudo_label_interval: int = 3
 
     prototype_stage_low_ratio_cutoff: float = 0.10
     prototype_per_class_map_low_ratio: Dict[int, int] = field(default_factory=lambda: {2: 3, 4: 3})
@@ -141,6 +150,7 @@ class TrainingConfig:
 
     use_ssl_pretrain: bool = True
     pretrain_epochs: int = 20
+    low_ratio_pretrain_epochs: int = 30
     pretrain_lr: float = 3e-4
     pretrain_weight_decay: float = 1e-4
     pretrain_graph_smooth_weight: float = 0.05
@@ -158,6 +168,15 @@ class TrainingConfig:
     classifier_weight: float = 1.0
     classifier_weight_final: float = 1.6
     classifier_label_smoothing: float = 0.03
+    classifier_hidden_dim: int = 256
+    use_hierarchical_classifier: bool = True
+    hierarchical_prior_scale: float = 0.70
+    use_effective_class_balancing: bool = True
+    class_balance_beta: float = 0.999
+    class_balance_weight_power: float = 1.0
+    class_balance_max_weight: float = 6.0
+    use_logit_adjustment: bool = True
+    logit_adjust_tau: float = 1.0
     prototypes_per_class: int = 3
     prototype_per_class_map: Dict[int, int] = field(default_factory=lambda: {2: 5, 4: 6})
     prototype_pooling: str = 'logsumexp'

@@ -32,6 +32,7 @@ class PseudoLabelGenerator:
         self.pseudo_temperature = float(pseudo_temperature)
         self.prototype_pooling = str(prototype_pooling).lower()
         self.prototype_pool_temperature = float(prototype_pool_temperature)
+        self.last_outputs: Dict[str, np.ndarray] = {}
 
     def generate(
         self,
@@ -58,8 +59,17 @@ class PseudoLabelGenerator:
 
         all_confidences = np.zeros(N, dtype=np.float32)
         all_confidences[~unlabeled_mask] = 1.0
+        num_classes = prototypes.size(0) if prototypes.dim() >= 2 else 0
+        all_probs = np.zeros((N, num_classes), dtype=np.float32)
+        if num_classes > 0 and (~unlabeled_mask).any():
+            all_probs[np.where(~unlabeled_mask)[0], labels[~unlabeled_mask].astype(np.int64)] = 1.0
 
         if unlabeled_mask.sum() == 0:
+            self.last_outputs = {
+                'probabilities': all_probs,
+                'confidences': all_confidences,
+                'predictions': labels.copy(),
+            }
             return labels, all_confidences
 
         z_u = torch.from_numpy(projected_embeddings[unlabeled_mask]).float().to(device)
@@ -80,11 +90,22 @@ class PseudoLabelGenerator:
 
         new_labels[high_idx] = preds[high_mask].cpu().numpy()
         all_confidences[u_idx] = confs.cpu().numpy()
+        all_probs[u_idx] = probs.detach().cpu().numpy()
+        pred_full = labels.copy()
+        pred_full[u_idx] = preds.detach().cpu().numpy()
+        self.last_outputs = {
+            'probabilities': all_probs,
+            'confidences': all_confidences.copy(),
+            'predictions': pred_full,
+        }
 
         return new_labels, all_confidences
 
     def generate_pseudo_labels(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
+
+    def get_last_outputs(self) -> Dict[str, np.ndarray]:
+        return self.last_outputs
 
 
 
@@ -145,6 +166,7 @@ class AdvancedPseudoLabelGenerator:
         self.unlabeled_prior_ema: Optional[torch.Tensor] = None
         self.class_reliability: Dict[int, float] = {}
         self.history: List[Dict] = []
+        self.last_outputs: Dict[str, np.ndarray] = {}
 
     def _get_dynamic_threshold(self, epoch: Optional[int]) -> float:
         if not self.progressive_threshold or epoch is None:
@@ -205,7 +227,16 @@ class AdvancedPseudoLabelGenerator:
 
         all_conf = np.zeros(N, dtype=np.float32)
         all_conf[~unlabeled_mask] = 1.0
+        num_classes = prototypes.size(0) if prototypes.dim() >= 2 else 0
+        all_probs = np.zeros((N, num_classes), dtype=np.float32)
+        if num_classes > 0 and (~unlabeled_mask).any():
+            all_probs[np.where(~unlabeled_mask)[0], labels[~unlabeled_mask].astype(np.int64)] = 1.0
         if unlabeled_mask.sum() == 0:
+            self.last_outputs = {
+                'probabilities': all_probs,
+                'confidences': all_conf,
+                'predictions': labels.copy(),
+            }
             return labels, all_conf
 
         z_u = torch.from_numpy(projected_embeddings[unlabeled_mask]).float().to(device)
@@ -277,10 +308,21 @@ class AdvancedPseudoLabelGenerator:
             if cval >= class_thr_np[j] and (top_k == 1 or mval >= class_mar_np[j]):
                 new_labels[u_idx[j]] = int(pr)
         all_conf[u_idx] = conf_np
+        all_probs[u_idx] = probs.detach().cpu().numpy()
+        pred_full = labels.copy()
+        pred_full[u_idx] = pred_np
+        self.last_outputs = {
+            'probabilities': all_probs,
+            'confidences': all_conf.copy(),
+            'predictions': pred_full,
+        }
         return new_labels, all_conf
 
     def generate_pseudo_labels(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
+
+    def get_last_outputs(self) -> Dict[str, np.ndarray]:
+        return self.last_outputs
 
     def _consistency_based_labeling(
         self,
@@ -642,51 +684,85 @@ def graph_label_propagation(
     min_support: float = 0.0,
     conf_power: float = 0.75,
     min_purity: float = 0.0,
+    seed_probabilities: np.ndarray = None,
+    graph_temperature: float = 0.20,
+    mutual_knn: bool = True,
+    seed_weight: float = 0.35,
+    entropy_weight: float = 0.20,
+    neighbor_agreement_weight: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    简单 LP：Y <- alpha * S * Y + (1-alpha) * Y0
-    - projected_embeddings: z_all (N,D)，已是 projector 输出（未必归一化，此处内部归一化）
-    - labels: 观测标签（含 -1 表示未标注）
-    返回：(pred_labels, confidences)
+    Soft-seeded LP with temperature-scaled kNN graph.
+    - labeled nodes use one-hot seeds
+    - unlabeled nodes can inject base/teacher probabilities as weak seeds
+    - confidence is calibrated by purity + neighborhood agreement + low entropy
     """
     z = torch.from_numpy(projected_embeddings).float()
     z = F.normalize(z, dim=1)
     N, _ = z.shape
+    unlabeled_mask_np = labels < 0
+
+    if N <= 1:
+        return np.full(N, -1, dtype=np.int64), np.zeros(N, dtype=np.float32)
 
     sim = torch.mm(z, z.t())
-    sim.fill_diagonal_(0.0)
-
+    sim.fill_diagonal_(-1.0)
     k = max(1, min(int(k), max(1, N - 1)))
-    topk = sim.topk(k, dim=1).indices
-    adj = torch.zeros_like(sim)
-    adj.scatter_(1, topk, sim.gather(1, topk))
-    adj = torch.max(adj, adj.t())
+    topk_vals, topk_idx = sim.topk(k, dim=1)
+    temp = max(float(graph_temperature), 1e-4)
+    topk_w = torch.softmax(topk_vals / temp, dim=1)
 
-    row_sum = adj.sum(dim=1, keepdim=True) + 1e-8
+    adj = torch.zeros_like(sim)
+    adj.scatter_(1, topk_idx, topk_w)
+    if mutual_knn:
+        adj = 0.5 * (adj + adj.t())
+    else:
+        adj = torch.maximum(adj, adj.t())
+    row_sum = adj.sum(dim=1, keepdim=True).clamp_min(1e-8)
     S = adj / row_sum
 
     C = int(labels[labels >= 0].max() + 1) if (labels >= 0).any() else 0
     if C == 0:
         return np.full(N, -1, dtype=np.int64), np.zeros(N, dtype=np.float32)
 
-    Y0 = torch.zeros(N, C)
+    Y0 = torch.zeros(N, C, dtype=torch.float32)
     labeled_idx = np.where(labels >= 0)[0]
     if len(labeled_idx) > 0:
         Y0[labeled_idx, labels[labeled_idx]] = 1.0
 
-    Y = Y0.clone()
-    for _ in range(iters):
-        Y = alpha * (S @ Y) + (1 - alpha) * Y0
+    if seed_probabilities is not None:
+        seed_probs = torch.as_tensor(seed_probabilities, dtype=torch.float32)
+        if seed_probs.ndim == 2 and seed_probs.shape[0] == N and seed_probs.shape[1] == C:
+            seed_probs = seed_probs / seed_probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            weak_seed = max(0.0, min(1.0, float(seed_weight)))
+            if weak_seed > 0.0:
+                Y0[unlabeled_mask_np] = weak_seed * seed_probs[unlabeled_mask_np]
 
-    support = torch.clamp(Y.sum(dim=1), min=0.0, max=1.0)
+    Y = Y0.clone()
+    labeled_mask_t = torch.from_numpy(labels >= 0)
+    for _ in range(iters):
+        Y = alpha * (S @ Y) + (1.0 - alpha) * Y0
+        if labeled_mask_t.any():
+            Y[labeled_mask_t] = Y0[labeled_mask_t]
+
     probs = Y / Y.sum(dim=1, keepdim=True).clamp_min(1e-8)
     purity_conf, pred = probs.max(dim=1)
-    support_conf = torch.pow(support, max(1e-4, float(conf_power)))
-    conf = 0.7 * purity_conf + 0.3 * support_conf
+    neighbor_class_probs = probs[:, pred].transpose(0, 1)
+    neighbor_support = torch.sum(S * neighbor_class_probs, dim=1)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=1) / np.log(max(C, 2))
+    entropy_conf = 1.0 - entropy
 
-    unlabeled_mask = torch.from_numpy(labels < 0)
+    purity_w = max(0.0, 1.0 - float(neighbor_agreement_weight) - float(entropy_weight))
+    conf = (
+        purity_w * purity_conf
+        + float(neighbor_agreement_weight) * neighbor_support
+        + float(entropy_weight) * entropy_conf
+    )
+    conf = torch.pow(conf.clamp(0.0, 1.0), max(float(conf_power), 1e-4))
+
+    unlabeled_mask = torch.from_numpy(unlabeled_mask_np)
     if min_support > 0:
-        low_support = unlabeled_mask & (support < float(min_support))
+        low_support = unlabeled_mask & (neighbor_support < float(min_support))
         conf = conf.masked_fill(low_support, 0.0)
         pred = pred.masked_fill(low_support, -1)
     if min_purity > 0:
@@ -695,7 +771,6 @@ def graph_label_propagation(
         pred = pred.masked_fill(low_purity, -1)
 
     return pred.numpy().astype(np.int64), conf.numpy().astype(np.float32)
-
 
 def apply_pseudo_label_acceptance_cap(
     labels: np.ndarray,

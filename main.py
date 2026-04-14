@@ -321,11 +321,20 @@ class TransportModeRecognitionPipeline:
 
         user_labels = [user_majority_label(u) for u in user_ids]
 
+        stratify_labels = user_labels
+        from collections import Counter
+        label_counter = Counter(user_labels)
+        if not label_counter or min(label_counter.values()) < 2:
+            stratify_labels = None
+            self.logger.warning(
+                "User-level stratified split fallback to unstratified because some classes have <2 users."
+            )
+
         train_users, val_users = train_test_split(
             user_ids,
             test_size=self.config.data.test_size,
             random_state=self.config.data.random_seed,
-            stratify=user_labels
+            stratify=stratify_labels
         )
 
         val_set = set(val_users)
@@ -506,10 +515,13 @@ class TransportModeRecognitionPipeline:
         overrides = {
             'labeled_ratio': ratio,
             'prototype_per_class_map_active': dict(tcfg.get('prototype_per_class_map', {}) or {}),
-            'use_ssl_pretrain': False,
+            'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
+            'pretrain_epochs': int(tcfg.get('pretrain_epochs', 20)),
         }
 
         low_cutoff = float(tcfg.get('low_ratio_cutoff', 0.10))
+
+        mid_cutoff = float(tcfg.get('mid_ratio_cutoff', 0.30))
 
         if ratio <= low_cutoff:
             overrides.update({
@@ -526,6 +538,18 @@ class TransportModeRecognitionPipeline:
                 'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
                 'prototype_per_class_map_active': dict(tcfg.get('prototype_per_class_map_low_ratio', tcfg.get('prototype_per_class_map', {})) or {}),
                 'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
+                'pretrain_epochs': int(tcfg.get('low_ratio_pretrain_epochs', tcfg.get('pretrain_epochs', 20))),
+            })
+        elif ratio <= mid_cutoff:
+            overrides.update({
+                'pseudo_warmup_epochs': int(tcfg.get('mid_ratio_pseudo_warmup_epochs', tcfg.get('pseudo_warmup_epochs', 6))),
+                'pseudo_label_interval': int(tcfg.get('mid_ratio_pseudo_label_interval', tcfg.get('pseudo_label_interval', 3))),
+                'pseudo_max_adoption_rate': float(tcfg.get('mid_ratio_initial_pseudo_max_adoption_rate', 0.15)),
+                'pseudo_target_adoption_rate': float(tcfg.get('mid_ratio_target_pseudo_max_adoption_rate', tcfg.get('pseudo_max_adoption_rate', 0.25))),
+                'hard_negative_weight_scale_low_ratio': 1.0,
+                'coarse_aux_weight_scale_low_ratio': 1.0,
+                'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
+                'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
             })
         else:
             overrides.update({
@@ -533,6 +557,7 @@ class TransportModeRecognitionPipeline:
                 'hard_negative_weight_scale_low_ratio': 1.0,
                 'coarse_aux_weight_scale_low_ratio': 1.0,
                 'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
+                'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
             })
 
         self.logger.info(f"Ratio-aware training overrides (ratio={ratio:.2f}): {overrides}")
@@ -564,7 +589,11 @@ class TransportModeRecognitionPipeline:
         self.classifier = ClassifierHead(
             input_dim=self.config.model.hidden_dim,
             num_classes=self.config.experiment.num_classes,
-            dropout=self.config.model.dropout
+            dropout=self.config.model.dropout,
+            hidden_dim=self.config.training.get('classifier_hidden_dim', self.config.model.hidden_dim),
+            coarse_groups=self.config.training.get('coarse_groups', [[0, 1], [2, 3], [4]]),
+            use_hierarchical=self.config.training.get('use_hierarchical_classifier', True),
+            hierarchical_prior_scale=self.config.training.get('hierarchical_prior_scale', 0.7),
         ).to(self.device)
 
         if self.config.training.get('use_gnn_aggregation', True):
@@ -793,6 +822,11 @@ class TransportModeRecognitionPipeline:
             'pseudo_lp_agree_threshold_offset': tget('pseudo_lp_agree_threshold_offset', 0.03),
             'pseudo_lp_conf_power': tget('pseudo_lp_conf_power', 0.75),
             'pseudo_lp_min_purity': tget('pseudo_lp_min_purity', 0.65),
+            'lp_graph_temperature': tget('lp_graph_temperature', 0.20),
+            'lp_mutual_knn': tget('lp_mutual_knn', True),
+            'lp_seed_weight': tget('lp_seed_weight', 0.35),
+            'lp_entropy_weight': tget('lp_entropy_weight', 0.20),
+            'lp_neighbor_agreement_weight': tget('lp_neighbor_agreement_weight', 0.25),
             'pseudo_conflict_threshold': tget('pseudo_conflict_threshold', 0.95),
             'pseudo_conflict_margin': tget('pseudo_conflict_margin', 0.15),
             'pseudo_allow_lp_only': tget('pseudo_allow_lp_only', False),
@@ -834,6 +868,15 @@ class TransportModeRecognitionPipeline:
             'classifier_weight': tget('classifier_weight', 1.0),
             'classifier_weight_final': tget('classifier_weight_final', tget('classifier_weight', 1.0)),
             'classifier_label_smoothing': tget('classifier_label_smoothing', 0.0),
+            'classifier_hidden_dim': tget('classifier_hidden_dim', self.config.model.hidden_dim),
+            'use_hierarchical_classifier': tget('use_hierarchical_classifier', True),
+            'hierarchical_prior_scale': tget('hierarchical_prior_scale', 0.7),
+            'use_effective_class_balancing': tget('use_effective_class_balancing', True),
+            'class_balance_beta': tget('class_balance_beta', 0.999),
+            'class_balance_weight_power': tget('class_balance_weight_power', 1.0),
+            'class_balance_max_weight': tget('class_balance_max_weight', 6.0),
+            'use_logit_adjustment': tget('use_logit_adjustment', True),
+            'logit_adjust_tau': tget('logit_adjust_tau', 1.0),
             'prototypes_per_class': tget('prototypes_per_class', 1),
             'prototype_per_class_map': tget('prototype_per_class_map_active', tget('prototype_per_class_map', {})),
             'prototype_per_class_map_low_ratio': tget('prototype_per_class_map_low_ratio', {}),
@@ -922,6 +965,7 @@ class TransportModeRecognitionPipeline:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+            self._restore_classifier_runtime_state(checkpoint)
         if self.graph_agg is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         prototypes = checkpoint.get('prototypes')
@@ -1373,6 +1417,7 @@ class TransportModeRecognitionPipeline:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+            self._restore_classifier_runtime_state(checkpoint)
         if self.graph_agg is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         prototypes = checkpoint.get('prototypes', None)
@@ -1660,6 +1705,12 @@ class TransportModeRecognitionPipeline:
         if isinstance(cfg, dict):
             return cfg.get(key, default)
         return getattr(cfg, key, default)
+
+    def _restore_classifier_runtime_state(self, checkpoint: Dict):
+        if getattr(self, 'classifier', None) is None:
+            return
+        if hasattr(self.classifier, 'set_logit_adjustment'):
+            self.classifier.set_logit_adjustment(checkpoint.get('classifier_logit_adjustment'))
 
     def _build_pseudo_label_generator(self, cfg=None):
         """构建与训练阶段一致的伪标签生成器（用于评估）"""

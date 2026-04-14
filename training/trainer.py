@@ -380,6 +380,77 @@ class Trainer:
         sample_w = w[labels]
         return sample_w / sample_w.mean().clamp_min(1e-6)
 
+    def _infer_train_label_counts(self) -> np.ndarray:
+        counts = np.zeros(self.num_classes, dtype=np.float64)
+        dataset = getattr(self.train_loader, 'dataset', None)
+        trajs = getattr(dataset, 'trajs', None)
+        if trajs is None:
+            return counts
+        for traj in trajs:
+            label = traj.get('label', -1)
+            if label is None:
+                continue
+            label = int(label)
+            if 0 <= label < self.num_classes:
+                counts[label] += 1
+        return counts
+
+    def _compute_effective_class_weights(self, counts: np.ndarray) -> torch.Tensor:
+        if not bool(self.config.get('use_effective_class_balancing', True)):
+            return torch.ones(self.num_classes, dtype=torch.float32)
+        beta = float(self.config.get('class_balance_beta', 0.999))
+        power = float(self.config.get('class_balance_weight_power', 1.0))
+        max_weight = float(self.config.get('class_balance_max_weight', 6.0))
+        weights = np.ones(self.num_classes, dtype=np.float64)
+        pos_mask = counts > 0
+        if pos_mask.any():
+            effective_num = 1.0 - np.power(beta, counts[pos_mask])
+            weights[pos_mask] = (1.0 - beta) / np.clip(effective_num, 1e-12, None)
+        weights = np.power(weights, power)
+        weights = np.clip(weights, 1e-3, max_weight)
+        mean_ref = weights[pos_mask].mean() if pos_mask.any() else weights.mean()
+        weights = weights / max(float(mean_ref), 1e-6)
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def _compute_coarse_class_weights(self, fine_weights: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self.coarse_groups:
+            return None
+        vals = []
+        for group in self.coarse_groups:
+            group_vals = [fine_weights[int(cls)] for cls in group if 0 <= int(cls) < fine_weights.numel()]
+            if group_vals:
+                vals.append(torch.stack(group_vals).mean())
+            else:
+                vals.append(torch.tensor(1.0, dtype=fine_weights.dtype, device=fine_weights.device))
+        coarse = torch.stack(vals)
+        return coarse / coarse.mean().clamp_min(1e-6)
+
+    def _compute_logit_adjustment(self, counts: np.ndarray) -> torch.Tensor:
+        if not bool(self.config.get('use_logit_adjustment', True)):
+            return torch.zeros(self.num_classes, dtype=torch.float32)
+        tau = float(self.config.get('logit_adjust_tau', 1.0))
+        if counts.sum() <= 0:
+            prior = np.full(self.num_classes, 1.0 / max(self.num_classes, 1), dtype=np.float64)
+        else:
+            prior = counts / counts.sum()
+        prior = np.clip(prior, 1e-8, 1.0)
+        adjustment = tau * np.log(prior)
+        adjustment = adjustment - adjustment.mean()
+        return torch.tensor(adjustment, dtype=torch.float32)
+
+    def _forward_classifier(self, h: torch.Tensor, return_aux: bool = False):
+        if self.classifier is None:
+            return None
+        try:
+            outputs = self.classifier(h, return_aux=return_aux)
+        except TypeError:
+            outputs = self.classifier(h)
+        if isinstance(outputs, dict):
+            return outputs if return_aux else outputs.get('logits')
+        if return_aux:
+            return {'logits': outputs, 'fine_logits': outputs, 'coarse_logits': None, 'features': h}
+        return outputs
+
     def _prototype_count_for_class(self, class_id: int) -> int:
         class_id = int(class_id)
         if not (0 <= class_id < len(self.class_prototype_counts)):
@@ -430,16 +501,28 @@ class Trainer:
             return torch.tensor(0.0, device=self.device)
         return torch.cat(losses).mean()
 
-    def _compute_coarse_aux_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _compute_coarse_aux_loss(
+            self,
+            logits: torch.Tensor,
+            labels: torch.Tensor,
+            coarse_logits: torch.Tensor = None
+    ) -> torch.Tensor:
         if self.coarse_aux_weight <= 0.0 or logits.numel() == 0 or not self.coarse_groups:
             return torch.tensor(0.0, device=self.device)
-        coarse_logits = []
-        for group in self.coarse_groups:
-            idx = torch.tensor(group, device=logits.device, dtype=torch.long)
-            coarse_logits.append(torch.logsumexp(logits[:, idx], dim=1))
-        coarse_logits = torch.stack(coarse_logits, dim=1)
-        coarse_targets = torch.tensor([self.fine_to_coarse[int(v)] for v in labels.detach().cpu().tolist()], device=labels.device)
-        return F.cross_entropy(coarse_logits, coarse_targets)
+        coarse_targets = torch.tensor(
+            [self.fine_to_coarse[int(v)] for v in labels.detach().cpu().tolist()],
+            device=labels.device
+        )
+        coarse_weight = self.coarse_class_weight_tensor
+        if coarse_weight is not None:
+            coarse_weight = coarse_weight.to(labels.device)
+        if coarse_logits is None:
+            coarse_logits_parts = []
+            for group in self.coarse_groups:
+                idx = torch.tensor(group, device=logits.device, dtype=torch.long)
+                coarse_logits_parts.append(torch.logsumexp(logits[:, idx], dim=1))
+            coarse_logits = torch.stack(coarse_logits_parts, dim=1)
+        return F.cross_entropy(coarse_logits, coarse_targets, weight=coarse_weight)
 
     def _update_pseudo_quality_ema(self, per_class_monitor: Dict[int, Dict[str, float]]):
         momentum = float(self.config.get('pseudo_quality_momentum', 0.7))
@@ -1067,7 +1150,8 @@ class Trainer:
                 )
 
                 if getattr(self, 'classifier', None) is not None and hasattr(self, 'ce_loss_fn'):
-                    logits = self.classifier(emb[labeled_mask])
+                    clf_outputs = self._forward_classifier(emb[labeled_mask], return_aux=True)
+                    logits = clf_outputs['logits']
                     ce_loss = self.ce_loss_fn(logits, labels[labeled_mask])
                 else:
                     logits = compute_prototype_logits(
@@ -1204,6 +1288,8 @@ class Trainer:
         # 保存分类头（如果存在）
         if hasattr(self, 'classifier') and self.classifier is not None:
             checkpoint['classifier_state_dict'] = self.classifier.state_dict()
+            if hasattr(self.classifier, 'logit_adjustment'):
+                checkpoint['classifier_logit_adjustment'] = self.classifier.logit_adjustment.detach().cpu()
         if getattr(self, 'graph_agg', None) is not None:
             checkpoint['graph_agg_state_dict'] = self.graph_agg.state_dict()
 
@@ -1226,6 +1312,8 @@ class Trainer:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if getattr(self, 'classifier', None) is not None and 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
+            if hasattr(self.classifier, 'set_logit_adjustment'):
+                self.classifier.set_logit_adjustment(checkpoint.get('classifier_logit_adjustment'))
         if getattr(self, 'graph_agg', None) is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         self.prototypes = checkpoint['prototypes'].to(self.device)
@@ -1271,10 +1359,22 @@ class SemiSupervisedTrainer(Trainer):
         self.classifier = classifier
         self.classifier_weight = float(self.config.get('classifier_weight', 1.0))
         self.classifier_weight_final = float(self.config.get('classifier_weight_final', self.classifier_weight))
-        cw = self.config.get('class_weights', None)
-        cw_t = torch.tensor(cw, dtype=torch.float32).to(self.device) if cw is not None else None
+        manual_cw = self.config.get('class_weights', None)
+        if manual_cw is not None:
+            manual_cw_t = torch.tensor(manual_cw, dtype=torch.float32, device=self.device)
+        else:
+            manual_cw_t = torch.ones(self.num_classes, dtype=torch.float32, device=self.device)
+
+        self.train_label_counts = self._infer_train_label_counts()
+        effective_cw_t = self._compute_effective_class_weights(self.train_label_counts).to(self.device)
+        combined_cw = manual_cw_t * effective_cw_t
+        combined_cw = combined_cw / combined_cw.mean().clamp_min(1e-6)
+        self.class_weight_tensor = combined_cw
+        self.coarse_class_weight_tensor = self._compute_coarse_class_weights(combined_cw)
+
         label_smoothing = float(self.config.get('classifier_label_smoothing', 0.0))
-        self.ce_loss_fn = nn.CrossEntropyLoss(weight=cw_t, label_smoothing=label_smoothing)
+        self.ce_loss_fn = nn.CrossEntropyLoss(weight=self.class_weight_tensor, label_smoothing=label_smoothing)
+        self.logit_adjustment = self._compute_logit_adjustment(self.train_label_counts).to(self.device)
 
         use_gnn = self.config.get('use_gnn_aggregation', True)
         if use_gnn:
@@ -1312,6 +1412,10 @@ class SemiSupervisedTrainer(Trainer):
             self.teacher_classifier = copy.deepcopy(classifier).to(self.device)
             for p in self.teacher_classifier.parameters():
                 p.requires_grad = False
+            if hasattr(self.classifier, 'set_logit_adjustment'):
+                self.classifier.set_logit_adjustment(self.logit_adjustment)
+            if hasattr(self.teacher_classifier, 'set_logit_adjustment'):
+                self.teacher_classifier.set_logit_adjustment(self.logit_adjustment)
         else:
             self.teacher_classifier = None
 
@@ -1424,10 +1528,15 @@ class SemiSupervisedTrainer(Trainer):
         hard_negative_loss = torch.tensor(0.0, device=self.device)
         coarse_loss = torch.tensor(0.0, device=self.device)
         if self.classifier is not None and labeled_mask.sum() > 0:
-            logits = self.classifier(emb1[labeled_mask])
+            clf_outputs = self._forward_classifier(emb1[labeled_mask], return_aux=True)
+            logits = clf_outputs['logits']
             ce_loss = self.ce_loss_fn(logits, labels[labeled_mask])
             hard_negative_loss = self._compute_hard_negative_loss(logits, labels[labeled_mask])
-            coarse_loss = self._compute_coarse_aux_loss(logits, labels[labeled_mask])
+            coarse_loss = self._compute_coarse_aux_loss(
+                logits,
+                labels[labeled_mask],
+                coarse_logits=clf_outputs.get('coarse_logits')
+            )
 
         # 伪标签损失
         pseudo_loss = torch.tensor(0.0, device=self.device)
@@ -1636,7 +1745,7 @@ class SemiSupervisedTrainer(Trainer):
         clf_pseudo_loss = torch.tensor(0.0, device=self.device)
         if self.classifier is not None and h is not None:
             pseudo_h = h[pseudo_mask_t]
-            clf_logits = self.classifier(pseudo_h)
+            clf_logits = self._forward_classifier(pseudo_h, return_aux=False)
             clf_per_sample = F.cross_entropy(clf_logits, pseudo_labels_tensor, reduction='none')
             clf_pseudo_loss = (clf_per_sample * pseudo_conf_tensor * sample_class_w).mean()
 
@@ -1671,7 +1780,7 @@ class SemiSupervisedTrainer(Trainer):
         clf_loss = torch.tensor(0.0, device=self.device)
         if self.classifier is not None and self.memory_h is not None:
             h_pseudo = torch.from_numpy(self.memory_h[idx]).float().to(self.device)
-            clf_logits = self.classifier(h_pseudo)
+            clf_logits = self._forward_classifier(h_pseudo, return_aux=False)
             clf_per_sample = F.cross_entropy(clf_logits, pseudo_labels_t, reduction='none')
             clf_loss = (clf_per_sample * pseudo_conf_t * sample_class_w).mean()
 
@@ -2034,6 +2143,10 @@ class SemiSupervisedTrainer(Trainer):
             epoch=self.current_epoch,
             teacher_clf_logits=all_teacher_clf_logits
         )
+        generator_outputs = {}
+        if hasattr(pseudo_label_generator, 'get_last_outputs'):
+            generator_outputs = pseudo_label_generator.get_last_outputs() or {}
+        seed_probabilities = generator_outputs.get('probabilities')
         # ====== 图式伪标签传播（LP） + 融合 ======
         # 全局 kNN 图仅供 LP 使用，在此按 interval 重建
         try:
@@ -2052,6 +2165,12 @@ class SemiSupervisedTrainer(Trainer):
                 min_support=self.config.get('lp_min_support', 0.60),
                 conf_power=self.config.get('pseudo_lp_conf_power', 0.75),
                 min_purity=self.config.get('pseudo_lp_min_purity', 0.0),
+                seed_probabilities=seed_probabilities,
+                graph_temperature=self.config.get('lp_graph_temperature', 0.20),
+                mutual_knn=self.config.get('lp_mutual_knn', True),
+                seed_weight=self.config.get('lp_seed_weight', 0.35),
+                entropy_weight=self.config.get('lp_entropy_weight', 0.20),
+                neighbor_agreement_weight=self.config.get('lp_neighbor_agreement_weight', 0.25),
             )
             static_thr = float(self.config.get('pseudo_label_threshold', 0.8))
             if hasattr(pseudo_label_generator, '_get_dynamic_threshold'):

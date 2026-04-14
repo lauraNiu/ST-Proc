@@ -10,22 +10,102 @@ import torch.nn.functional as F
 
 class ClassifierHead(nn.Module):
     """
-    标准分类头：直接在编码器输出 h 上做 cross-entropy 分类。
-    推理时优先使用，比 prototype nearest-neighbor 更稳定。
+    分层分类头：
+    - shared trunk
+    - fine head over all classes
+    - optional coarse head whose log-prob acts as a prior on fine logits
     """
-    def __init__(self, input_dim: int = 256, num_classes: int = 5, dropout: float = 0.1):
+    def __init__(
+        self,
+        input_dim: int = 256,
+        num_classes: int = 5,
+        dropout: float = 0.1,
+        hidden_dim: int = None,
+        coarse_groups=None,
+        use_hierarchical: bool = True,
+        hierarchical_prior_scale: float = 0.7,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.LayerNorm(input_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim, num_classes)
+        hidden_dim = int(hidden_dim or input_dim)
+        self.num_classes = int(num_classes)
+        self.use_hierarchical = bool(use_hierarchical)
+        self.hierarchical_prior_scale = float(hierarchical_prior_scale)
+        self.coarse_groups = coarse_groups or [[i] for i in range(self.num_classes)]
+        self.register_buffer(
+            'fine_to_coarse',
+            self._build_fine_to_coarse(self.num_classes, self.coarse_groups),
+            persistent=False,
+        )
+        self.register_buffer(
+            'logit_adjustment',
+            torch.zeros(self.num_classes, dtype=torch.float32),
+            persistent=False,
         )
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """h: [B, input_dim] -> logits: [B, num_classes]"""
-        return self.net(h)
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fine_head = nn.Linear(hidden_dim, self.num_classes)
+        self.coarse_head = (
+            nn.Linear(hidden_dim, len(self.coarse_groups))
+            if self.use_hierarchical and len(self.coarse_groups) > 1
+            else None
+        )
+
+    @staticmethod
+    def _build_fine_to_coarse(num_classes: int, coarse_groups) -> torch.Tensor:
+        mapping = torch.zeros(num_classes, dtype=torch.long)
+        assigned = set()
+        for group_idx, group in enumerate(coarse_groups):
+            for cls in group:
+                cls = int(cls)
+                if 0 <= cls < num_classes:
+                    mapping[cls] = group_idx
+                    assigned.add(cls)
+        for cls in range(num_classes):
+            if cls not in assigned:
+                mapping[cls] = min(cls, max(0, len(coarse_groups) - 1))
+        return mapping
+
+    def set_logit_adjustment(self, adjustment: torch.Tensor):
+        if adjustment is None:
+            self.logit_adjustment.zero_()
+            return
+        adj = torch.as_tensor(adjustment, dtype=torch.float32, device=self.logit_adjustment.device).view(-1)
+        if adj.numel() != self.num_classes:
+            raise ValueError(f'logit adjustment size mismatch: expected {self.num_classes}, got {adj.numel()}')
+        self.logit_adjustment.copy_(adj)
+
+    def forward(self, h: torch.Tensor, return_aux: bool = False):
+        """
+        Args:
+            h: [B, input_dim]
+            return_aux: whether to return fine/coarse auxiliary logits
+        """
+        feat = self.trunk(h)
+        fine_logits = self.fine_head(feat)
+        coarse_logits = None
+
+        if self.coarse_head is not None:
+            coarse_logits = self.coarse_head(feat)
+            coarse_log_probs = F.log_softmax(coarse_logits, dim=1)
+            fine_logits = fine_logits + self.hierarchical_prior_scale * coarse_log_probs[:, self.fine_to_coarse]
+
+        if self.logit_adjustment.numel() == fine_logits.size(1):
+            fine_logits = fine_logits + self.logit_adjustment.to(fine_logits.device)
+
+        if not return_aux:
+            return fine_logits
+
+        return {
+            'logits': fine_logits,
+            'fine_logits': fine_logits,
+            'coarse_logits': coarse_logits,
+            'features': feat,
+        }
 
 
 class ProjectionHead(nn.Module):
