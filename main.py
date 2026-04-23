@@ -44,6 +44,8 @@ import numpy as np
 from utils.logger import get_logger
 from utils.helper import (
     set_seed,
+    seed_worker,
+    create_torch_generator,
     ensure_dir,
     get_device,
     Timer,
@@ -78,7 +80,9 @@ class TransportModeRecognitionPipeline:
         self.logger.log_section(f"🚀 初始化交通方式识别系统 (模式: {mode})")
         self.logger.info(f"📁 实验目录: {self.exp_dir}")
         self.logger.info(f"🖥️  设备: {self.device}")
-        set_seed(config.data.random_seed)
+        self.seed = int(config.data.random_seed)
+        self.deterministic = bool(getattr(config.experiment, 'deterministic', True))
+        set_seed(self.seed, deterministic=self.deterministic)
 
         # 标签名称映射
         self.label_names = config.label_names
@@ -155,7 +159,13 @@ class TransportModeRecognitionPipeline:
             self.data_loader = ImprovedGeoLifeDataLoader(
                 data_root=self.config.data.data_root,
                 label_mapping=self.config.label_mapping,
-                min_overlap=self.config.data.get('min_label_overlap', 0.35)  # 新增：可调到 0.5
+                min_overlap=self.config.data.get('min_label_overlap', 0.35),
+                segment_by_label=self.config.data.get('segment_by_label', True),
+                min_label_purity=self.config.data.get('min_label_purity', 0.80),
+                min_segment_points=self.config.data.get('min_segment_points', self.config.data.min_points),
+                drop_mixed_segments=self.config.data.get('drop_mixed_segments', True),
+                keep_unlabeled_segments=self.config.data.get('keep_unlabeled_segments', False),
+                label_names=self.config.label_names,
             )
 
             # 只加载有标签的用户
@@ -196,9 +206,13 @@ class TransportModeRecognitionPipeline:
                 f"{len(labeled_trajectories)} 条有标签, {len(unlabeled_trajectories)} 条无标签"
             )
 
-        # benchmark 模式下只在已标注样本上做 user-disjoint 划分；
-        # 只有显式开启时才把真实无标签用户并入训练。
-        train_labeled, val_trajectories = self._split_dataset_stratified(labeled_trajectories)
+        # 当前默认使用 sample split；如需更严格的跨用户协议可切到 user_disjoint。
+        split_mode = getattr(self.config.data, 'split_mode', 'sample')
+        if split_mode == 'sample':
+            self.logger.info('当前使用 sample-wise split（同一用户轨迹可同时出现在训练/验证中）')
+            train_labeled, val_trajectories = self._split_dataset(labeled_trajectories)
+        else:
+            train_labeled, val_trajectories = self._split_dataset_stratified(labeled_trajectories)
         include_real_unlabeled = bool(
             getattr(self.config.data, 'include_real_unlabeled_in_train', False)
         )
@@ -321,20 +335,11 @@ class TransportModeRecognitionPipeline:
 
         user_labels = [user_majority_label(u) for u in user_ids]
 
-        stratify_labels = user_labels
-        from collections import Counter
-        label_counter = Counter(user_labels)
-        if not label_counter or min(label_counter.values()) < 2:
-            stratify_labels = None
-            self.logger.warning(
-                "User-level stratified split fallback to unstratified because some classes have <2 users."
-            )
-
         train_users, val_users = train_test_split(
             user_ids,
             test_size=self.config.data.test_size,
             random_state=self.config.data.random_seed,
-            stratify=stratify_labels
+            stratify=user_labels
         )
 
         val_set = set(val_users)
@@ -436,7 +441,7 @@ class TransportModeRecognitionPipeline:
             self.logger.info(f"   {label_name}: {count}")
 
     def _apply_label_masking(self, trajectories: List[Dict], label_ratio: float,
-                             min_samples_per_class: int = 5):
+                             min_samples_per_class: int = None):
         """隐藏部分标签"""
         from collections import Counter
 
@@ -447,8 +452,13 @@ class TransportModeRecognitionPipeline:
             return trajectories
 
         masked_trajectories = [t.copy() for t in trajectories]
+        if min_samples_per_class is None:
+            min_samples_per_class = int(
+                getattr(self.config.data, 'min_samples_per_class', 5)
+            )
         labels = [t['label'] for t in masked_trajectories if t['label'] is not None and t['label'] >= 0]
         label_counts = Counter(labels)
+        rng = np.random.default_rng(self.config.data.random_seed)
 
         self.logger.info(f"   📊 原始标签分布: {dict(label_counts)}")
 
@@ -465,8 +475,7 @@ class TransportModeRecognitionPipeline:
             )
             n_keep = min(n_keep, count)  # 不超过总数
 
-            np.random.seed(self.config.data.random_seed)
-            keep_indices = np.random.choice(indices, size=n_keep, replace=False)
+            keep_indices = rng.choice(indices, size=n_keep, replace=False)
 
             # 隐藏未选中的标签
             for idx in indices:
@@ -515,18 +524,18 @@ class TransportModeRecognitionPipeline:
         overrides = {
             'labeled_ratio': ratio,
             'prototype_per_class_map_active': dict(tcfg.get('prototype_per_class_map', {}) or {}),
-            'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
-            'pretrain_epochs': int(tcfg.get('pretrain_epochs', 20)),
+            'use_ssl_pretrain': False,
         }
 
         low_cutoff = float(tcfg.get('low_ratio_cutoff', 0.10))
-
-        mid_cutoff = float(tcfg.get('mid_ratio_cutoff', 0.30))
+        mid_cutoff = float(tcfg.get('mid_ratio_cutoff', 0.20))
 
         if ratio <= low_cutoff:
             overrides.update({
                 'pseudo_warmup_epochs': int(tcfg.get('low_ratio_pseudo_warmup_epochs', tcfg.get('pseudo_warmup_epochs', 10))),
                 'pseudo_label_interval': int(tcfg.get('low_ratio_pseudo_label_interval', tcfg.get('pseudo_label_interval', 5))),
+                'pseudo_label_threshold': float(tcfg.get('low_ratio_pseudo_label_threshold', tcfg.get('pseudo_label_threshold', 0.88))),
+                'pseudo_threshold_min': float(tcfg.get('low_ratio_pseudo_threshold_min', tcfg.get('pseudo_threshold_min', 0.86))),
                 'pseudo_max_adoption_rate': float(tcfg.get('low_ratio_initial_pseudo_max_adoption_rate', tcfg.get('pseudo_max_adoption_rate', 0.25))),
                 'pseudo_target_adoption_rate': float(tcfg.get('low_ratio_target_pseudo_max_adoption_rate', tcfg.get('pseudo_max_adoption_rate', 0.25))),
                 'pseudo_cap_ramp_epochs': int(tcfg.get('low_ratio_cap_ramp_epochs', 30)),
@@ -538,26 +547,27 @@ class TransportModeRecognitionPipeline:
                 'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
                 'prototype_per_class_map_active': dict(tcfg.get('prototype_per_class_map_low_ratio', tcfg.get('prototype_per_class_map', {})) or {}),
                 'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
-                'pretrain_epochs': int(tcfg.get('low_ratio_pretrain_epochs', tcfg.get('pretrain_epochs', 20))),
             })
         elif ratio <= mid_cutoff:
             overrides.update({
-                'pseudo_warmup_epochs': int(tcfg.get('mid_ratio_pseudo_warmup_epochs', tcfg.get('pseudo_warmup_epochs', 6))),
-                'pseudo_label_interval': int(tcfg.get('mid_ratio_pseudo_label_interval', tcfg.get('pseudo_label_interval', 3))),
-                'pseudo_max_adoption_rate': float(tcfg.get('mid_ratio_initial_pseudo_max_adoption_rate', 0.15)),
+                'pseudo_warmup_epochs': int(tcfg.get('mid_ratio_pseudo_warmup_epochs', tcfg.get('pseudo_warmup_epochs', 10))),
+                'pseudo_label_interval': int(tcfg.get('mid_ratio_pseudo_label_interval', tcfg.get('pseudo_label_interval', 5))),
+                'pseudo_label_threshold': float(tcfg.get('mid_ratio_pseudo_label_threshold', tcfg.get('pseudo_label_threshold', 0.88))),
+                'pseudo_threshold_min': float(tcfg.get('mid_ratio_pseudo_threshold_min', tcfg.get('pseudo_threshold_min', 0.86))),
+                'pseudo_max_adoption_rate': float(tcfg.get('mid_ratio_initial_pseudo_max_adoption_rate', tcfg.get('pseudo_max_adoption_rate', 0.25))),
                 'pseudo_target_adoption_rate': float(tcfg.get('mid_ratio_target_pseudo_max_adoption_rate', tcfg.get('pseudo_max_adoption_rate', 0.25))),
                 'hard_negative_weight_scale_low_ratio': 1.0,
                 'coarse_aux_weight_scale_low_ratio': 1.0,
                 'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
-                'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
             })
         else:
             overrides.update({
+                'pseudo_label_threshold': float(tcfg.get('pseudo_label_threshold', 0.88)),
+                'pseudo_threshold_min': float(tcfg.get('pseudo_threshold_min', 0.86)),
                 'pseudo_target_adoption_rate': float(tcfg.get('pseudo_max_adoption_rate', 0.25)),
                 'hard_negative_weight_scale_low_ratio': 1.0,
                 'coarse_aux_weight_scale_low_ratio': 1.0,
                 'low_ratio_aux_ramp_epochs': int(tcfg.get('low_ratio_aux_ramp_epochs', 35)),
-                'use_ssl_pretrain': bool(tcfg.get('use_ssl_pretrain', True)),
             })
 
         self.logger.info(f"Ratio-aware training overrides (ratio={ratio:.2f}): {overrides}")
@@ -589,11 +599,7 @@ class TransportModeRecognitionPipeline:
         self.classifier = ClassifierHead(
             input_dim=self.config.model.hidden_dim,
             num_classes=self.config.experiment.num_classes,
-            dropout=self.config.model.dropout,
-            hidden_dim=self.config.training.get('classifier_hidden_dim', self.config.model.hidden_dim),
-            coarse_groups=self.config.training.get('coarse_groups', [[0, 1], [2, 3], [4]]),
-            use_hierarchical=self.config.training.get('use_hierarchical_classifier', True),
-            hierarchical_prior_scale=self.config.training.get('hierarchical_prior_scale', 0.7),
+            dropout=self.config.model.dropout
         ).to(self.device)
 
         if self.config.training.get('use_gnn_aggregation', True):
@@ -645,7 +651,8 @@ class TransportModeRecognitionPipeline:
         hard_class_boost = dict(self.config.training.get('sampler_hard_class_boost', {}) or {})
         weights = np.full(len(labels), unlabeled_weight, dtype=np.float64)
         sampler_class_weights = {}
-        if labeled_mask.any():
+        use_weighted_sampler = bool(self.config.training.get('use_weighted_sampler', True))
+        if use_weighted_sampler and labeled_mask.any():
             labeled_labels = labels[labeled_mask].astype(np.int64)
             class_counts = np.bincount(labeled_labels, minlength=self.config.experiment.num_classes)
             positive_counts = class_counts[class_counts > 0]
@@ -667,20 +674,35 @@ class TransportModeRecognitionPipeline:
                 for cls in sorted(sampler_class_weights)
             )
             self.logger.info(f"采样器类别权重: [{class_weight_str}] | unlabeled:{unlabeled_display:.3f}")
+        else:
+            self.logger.info("采样器: 使用普通随机打乱，不启用加权采样")
 
-        sampler = WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(self.train_dataset),
-            replacement=True
-        )
+        data_seed = int(self.config.data.random_seed)
+        sampler_generator = create_torch_generator(data_seed)
+        loader_generator = create_torch_generator(data_seed + 1)
+        val_generator = create_torch_generator(data_seed + 2)
+
+        sampler = None
+        shuffle = True
+        if use_weighted_sampler:
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(self.train_dataset),
+                replacement=True,
+                generator=sampler_generator,
+            )
+            shuffle = False
 
         train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.training.batch_size,
             sampler=sampler,
+            shuffle=shuffle,
             collate_fn=traj_collate_fn,
             num_workers=self.config.experiment.get('num_workers', 0),
-            pin_memory=True if self.device.type == 'cuda' else False
+            pin_memory=True if self.device.type == 'cuda' else False,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
         )
 
         val_loader = DataLoader(
@@ -688,14 +710,20 @@ class TransportModeRecognitionPipeline:
             batch_size=self.config.training.batch_size * 2,
             shuffle=False,
             collate_fn=traj_collate_fn,
-            num_workers=self.config.experiment.get('num_workers', 0)
+            num_workers=self.config.experiment.get('num_workers', 0),
+            worker_init_fn=seed_worker,
+            generator=val_generator,
         )
 
         # 创建伪标签生成器
         generator_name = self.config.training.pseudo_label_generator
+        clean_baseline_mode = bool(tget('clean_supervised_baseline', self.config.training.clean_supervised_baseline))
 
         if generator_name == 'naive':
-            self.logger.info("Using Naive Pseudo-Label Generator (Fixed Threshold)")
+            if clean_baseline_mode:
+                self.logger.info("Clean baseline: build naive pseudo generator for offline evaluation only")
+            else:
+                self.logger.info("Using Naive Pseudo-Label Generator (Fixed Threshold)")
             pseudo_label_gen = PseudoLabelGenerator(
                 confidence_threshold=0.95,
                 pseudo_temperature=tget('pseudo_confidence_temperature', 0.30),
@@ -703,7 +731,10 @@ class TransportModeRecognitionPipeline:
                 prototype_pool_temperature=tget('prototype_pool_temperature', 1.0),
             )
         elif generator_name == 'advanced_no_margin':
-            self.logger.info("Using Advanced Generator (w/o Margin Filter)")
+            if clean_baseline_mode:
+                self.logger.info("Clean baseline: build advanced pseudo generator for offline evaluation only")
+            else:
+                self.logger.info("Using Advanced Generator (w/o Margin Filter)")
             pseudo_label_gen = AdvancedPseudoLabelGenerator(
                 confidence_threshold=tget('pseudo_label_threshold', self.config.training.pseudo_label_threshold),
                 progressive_threshold=tget('pseudo_progressive_threshold', False),
@@ -726,9 +757,20 @@ class TransportModeRecognitionPipeline:
                 reliability_gate=tget('pseudo_reliability_gate', False),
                 reliability_power=tget('pseudo_reliability_power', 1.0),
                 reliability_floor=tget('pseudo_reliability_floor', 0.35),
+                require_teacher_proto_agreement=tget('pseudo_require_teacher_proto_agreement', False),
             )
         else:
-            self.logger.info("Using Full Advanced Pseudo-Label Generator")
+            teacher_clf_weight = float(tget('teacher_clf_pseudo_weight', 0.0))
+            proto_weight = float(tget('proto_pseudo_weight', 1.0))
+            use_graph_lp = bool(tget('use_graph_lp', False))
+            if clean_baseline_mode:
+                self.logger.info("Clean baseline: build advanced pseudo generator for offline evaluation only")
+            elif teacher_clf_weight > 0.0 and proto_weight == 0.0 and not use_graph_lp:
+                self.logger.info("Using conservative teacher-classifier pseudo labels")
+            elif teacher_clf_weight > 0.0 and proto_weight > 0.0 and use_graph_lp:
+                self.logger.info("Using full advanced pseudo-label fusion")
+            else:
+                self.logger.info("Using configurable advanced pseudo-label generator")
             pseudo_label_gen = AdvancedPseudoLabelGenerator(
                 confidence_threshold=tget('pseudo_label_threshold', self.config.training.pseudo_label_threshold),
                 progressive_threshold=tget('pseudo_progressive_threshold', False),
@@ -742,8 +784,8 @@ class TransportModeRecognitionPipeline:
                 threshold_decay=tget('pseudo_threshold_decay', 0.02),
                 threshold_decay_interval=tget('pseudo_threshold_decay_interval', 10),
                 low_margin_penalty=tget('pseudo_low_margin_penalty', 0.90),
-                teacher_clf_weight=tget('teacher_clf_pseudo_weight', 0.0),
-                proto_weight=tget('proto_pseudo_weight', 1.0),
+                teacher_clf_weight=teacher_clf_weight,
+                proto_weight=proto_weight,
                 prototype_pooling=tget('prototype_pooling', 'max'),
                 prototype_pool_temperature=tget('prototype_pool_temperature', 1.0),
                 confidence_floor=tget('pseudo_confidence_floor', 0.0),
@@ -755,12 +797,16 @@ class TransportModeRecognitionPipeline:
                 reliability_gate=tget('pseudo_reliability_gate', False),
                 reliability_power=tget('pseudo_reliability_power', 1.0),
                 reliability_floor=tget('pseudo_reliability_floor', 0.35),
+                require_teacher_proto_agreement=tget('pseudo_require_teacher_proto_agreement', False),
             )
 
         config_dict = {
             'num_classes': self.config.experiment.num_classes,
+            'label_names': dict(self.label_names),
             'projection_dim': self.config.model.projection_dim,
             'temperature': self.config.training.temperature,
+            'use_contrastive': tget('use_contrastive', self.config.training.use_contrastive),
+            'use_proto': tget('use_proto', self.config.training.use_proto),
             'contrast_weight': tget('contrast_weight', 1.0),
             'proto_weight': tget('proto_weight', self.config.training.proto_weight),
             'proto_weight_final': tget('proto_weight_final', self.config.training.proto_weight),
@@ -822,11 +868,6 @@ class TransportModeRecognitionPipeline:
             'pseudo_lp_agree_threshold_offset': tget('pseudo_lp_agree_threshold_offset', 0.03),
             'pseudo_lp_conf_power': tget('pseudo_lp_conf_power', 0.75),
             'pseudo_lp_min_purity': tget('pseudo_lp_min_purity', 0.65),
-            'lp_graph_temperature': tget('lp_graph_temperature', 0.20),
-            'lp_mutual_knn': tget('lp_mutual_knn', True),
-            'lp_seed_weight': tget('lp_seed_weight', 0.35),
-            'lp_entropy_weight': tget('lp_entropy_weight', 0.20),
-            'lp_neighbor_agreement_weight': tget('lp_neighbor_agreement_weight', 0.25),
             'pseudo_conflict_threshold': tget('pseudo_conflict_threshold', 0.95),
             'pseudo_conflict_margin': tget('pseudo_conflict_margin', 0.15),
             'pseudo_allow_lp_only': tget('pseudo_allow_lp_only', False),
@@ -837,12 +878,23 @@ class TransportModeRecognitionPipeline:
             'use_pseudo_for_proto_ema': tget('use_pseudo_for_proto_ema', False),
             'pseudo_proto_ema_agreement_only': tget('pseudo_proto_ema_agreement_only', True),
             'use_teacher_clf_pseudo': tget('use_teacher_clf_pseudo', True),
-            'teacher_clf_pseudo_weight': tget('teacher_clf_pseudo_weight', 0.7),
-            'proto_pseudo_weight': tget('proto_pseudo_weight', 0.3),
+            'teacher_clf_pseudo_weight': tget('teacher_clf_pseudo_weight', self.config.training.teacher_clf_pseudo_weight),
+            'proto_pseudo_weight': tget('proto_pseudo_weight', self.config.training.proto_pseudo_weight),
+            'pseudo_require_teacher_proto_agreement': tget('pseudo_require_teacher_proto_agreement', self.config.training.pseudo_require_teacher_proto_agreement),
             'pseudo_class_quota_per_update': tget('pseudo_class_quota_per_update', 0),
+            'pseudo_dynamic_class_quota': tget('pseudo_dynamic_class_quota', self.config.training.pseudo_dynamic_class_quota),
+            'pseudo_class_quota_quality_floor': tget('pseudo_class_quota_quality_floor', self.config.training.pseudo_class_quota_quality_floor),
+            'pseudo_class_quota_bootstrap_per_class': tget('pseudo_class_quota_bootstrap_per_class', self.config.training.pseudo_class_quota_bootstrap_per_class),
+            'pseudo_class_quota_quality_bins': tget('pseudo_class_quota_quality_bins', self.config.training.pseudo_class_quota_quality_bins),
+            'pseudo_class_quota_bin_values': tget('pseudo_class_quota_bin_values', self.config.training.pseudo_class_quota_bin_values),
             'patience_after_pseudo': tget('patience_after_pseudo', 20),
             'use_gnn_aggregation': tget('use_gnn_aggregation', True),
+            'use_graph_lp': tget('use_graph_lp', False),
+            'pseudo_supervision_target': tget('pseudo_supervision_target', self.config.training.pseudo_supervision_target),
+            'clean_supervised_baseline': tget('clean_supervised_baseline', self.config.training.clean_supervised_baseline),
             'sampler_hard_class_boost': tget('sampler_hard_class_boost', {}),
+            'supcon_weight': tget('supcon_weight', self.config.training.supcon_weight),
+            'supcon_temperature': tget('supcon_temperature', self.config.training.supcon_temperature),
         }
 
         config_dict.update({
@@ -868,15 +920,6 @@ class TransportModeRecognitionPipeline:
             'classifier_weight': tget('classifier_weight', 1.0),
             'classifier_weight_final': tget('classifier_weight_final', tget('classifier_weight', 1.0)),
             'classifier_label_smoothing': tget('classifier_label_smoothing', 0.0),
-            'classifier_hidden_dim': tget('classifier_hidden_dim', self.config.model.hidden_dim),
-            'use_hierarchical_classifier': tget('use_hierarchical_classifier', True),
-            'hierarchical_prior_scale': tget('hierarchical_prior_scale', 0.7),
-            'use_effective_class_balancing': tget('use_effective_class_balancing', True),
-            'class_balance_beta': tget('class_balance_beta', 0.999),
-            'class_balance_weight_power': tget('class_balance_weight_power', 1.0),
-            'class_balance_max_weight': tget('class_balance_max_weight', 6.0),
-            'use_logit_adjustment': tget('use_logit_adjustment', True),
-            'logit_adjust_tau': tget('logit_adjust_tau', 1.0),
             'prototypes_per_class': tget('prototypes_per_class', 1),
             'prototype_per_class_map': tget('prototype_per_class_map_active', tget('prototype_per_class_map', {})),
             'prototype_per_class_map_low_ratio': tget('prototype_per_class_map_low_ratio', {}),
@@ -906,6 +949,29 @@ class TransportModeRecognitionPipeline:
             config_dict['lambda_graph_smooth'] = 0.0
             config_dict['lambda_graph_contrast'] = 0.0
             self.logger.info("   use_semi_supervised=False: 禁用伪标签/一致性/图损失")
+
+        if bool(config_dict.get('clean_supervised_baseline', False)):
+            config_dict['use_contrastive'] = False
+            config_dict['use_proto'] = False
+            config_dict['pseudo_weight'] = 0.0
+            config_dict['consistency_weight'] = 0.0
+            config_dict['pseudo_label_interval'] = 0
+            config_dict['use_teacher_clf_pseudo'] = False
+            config_dict['teacher_clf_pseudo_weight'] = 0.0
+            config_dict['proto_pseudo_weight'] = 0.0
+            config_dict['lambda_graph_smooth'] = 0.0
+            config_dict['lambda_graph_contrast'] = 0.0
+            config_dict['use_ssl_pretrain'] = False
+            config_dict['use_gnn_aggregation'] = False
+            config_dict['use_graph_lp'] = False
+            config_dict['hard_negative_weight'] = 0.0
+            config_dict['coarse_aux_weight'] = 0.0
+            config_dict['use_stagewise_loss_schedule'] = False
+            config_dict['classifier_weight_final'] = config_dict.get('classifier_weight', 1.0)
+            config_dict['prototypes_per_class'] = 1
+            config_dict['prototype_per_class_map'] = {}
+            config_dict['prototype_per_class_map_low_ratio'] = {}
+            self.logger.info("   clean_supervised_baseline=True: 仅保留 encoder + classifier + class-weighted CE")
 
         # full-label setting 不再沿用重 SSL 约束，避免把监督上界压平
         if (self.config.data.labeled_ratio >= 1.0 and
@@ -965,7 +1031,6 @@ class TransportModeRecognitionPipeline:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
-            self._restore_classifier_runtime_state(checkpoint)
         if self.graph_agg is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         prototypes = checkpoint.get('prototypes')
@@ -1077,6 +1142,7 @@ class TransportModeRecognitionPipeline:
         # === 5. 伪标签质量评估===
         with Timer("伪标签质量评估"):
             pseudo_eval_results = self._evaluate_pseudo_labels_correct(
+                h_train,
                 z_train,
                 self.train_dataset,  # 传入dataset以获取观测标签
                 self.train_full_labels,
@@ -1223,12 +1289,13 @@ class TransportModeRecognitionPipeline:
 
     def _evaluate_pseudo_labels_correct(
             self,
+            h_train: np.ndarray,
             z_train: np.ndarray,
             train_dataset,
             train_true_labels: np.ndarray,
             prototypes: torch.Tensor
     ) -> Dict:
-        """伪标签质量评估：使用与训练时完全一致的融合流程（阈值过滤+margin+LP+融合）"""
+        """伪标签质量评估：复现训练时的当前伪标签路径。"""
         from training.pseudo_label import (
             PSEUDO_SOURCE_ABSTAIN,
             PSEUDO_SOURCE_AGREE,
@@ -1236,7 +1303,9 @@ class TransportModeRecognitionPipeline:
             PSEUDO_SOURCE_BASE_ONLY,
             PSEUDO_SOURCE_LP_CONFLICT,
             PSEUDO_SOURCE_LP_ONLY,
+            PSEUDO_SOURCE_OBSERVED,
             apply_pseudo_label_acceptance_cap,
+            class_balanced_pseudo_cap,
             fuse_pseudo_labels,
             graph_label_propagation,
         )
@@ -1252,39 +1321,59 @@ class TransportModeRecognitionPipeline:
         # Step1: 与训练阶段一致的伪标签生成器与有效训练配置
         gen = self._build_pseudo_label_generator(eval_cfg)
         eval_epoch = getattr(self, '_best_ckpt_epoch', None)
+        teacher_logits = None
+        if (
+            self._cfg_get(eval_cfg, 'use_teacher_clf_pseudo', False)
+            and self._cfg_get(eval_cfg, 'teacher_clf_pseudo_weight', 0.0) > 0.0
+        ):
+            with torch.no_grad():
+                teacher_logits = self.classifier(
+                    torch.from_numpy(h_train).to(self.device)
+                ).cpu().numpy()
+
         base_labels, base_conf = gen.generate(
             projected_embeddings=z_train,
             labels=train_observed_labels,
             prototypes=prototypes,
-            epoch=eval_epoch
+            epoch=eval_epoch,
+            teacher_clf_logits=teacher_logits,
         )
 
-        # Step2: graph LP
-        glp_labels, glp_conf = graph_label_propagation(
-            projected_embeddings=z_train,
-            labels=train_observed_labels,
-            k=self._cfg_get(eval_cfg, 'graph_k', self.config.training.graph_k),
-            alpha=self._cfg_get(eval_cfg, 'lp_alpha', self.config.training.lp_alpha),
-            iters=self._cfg_get(eval_cfg, 'lp_iters', self.config.training.lp_iters),
-            min_support=self._cfg_get(eval_cfg, 'lp_min_support', 0.60),
-            conf_power=self._cfg_get(eval_cfg, 'pseudo_lp_conf_power', 0.75),
-            min_purity=self._cfg_get(eval_cfg, 'pseudo_lp_min_purity', 0.0),
-        )
+        use_graph_lp = bool(self._cfg_get(eval_cfg, 'use_graph_lp', False))
+        eval_mode_name = 'teacher/prototype'
+        if use_graph_lp:
+            glp_labels, glp_conf = graph_label_propagation(
+                projected_embeddings=z_train,
+                labels=train_observed_labels,
+                k=self._cfg_get(eval_cfg, 'graph_k', self.config.training.graph_k),
+                alpha=self._cfg_get(eval_cfg, 'lp_alpha', self.config.training.lp_alpha),
+                iters=self._cfg_get(eval_cfg, 'lp_iters', self.config.training.lp_iters),
+                min_support=self._cfg_get(eval_cfg, 'lp_min_support', 0.60),
+                conf_power=self._cfg_get(eval_cfg, 'pseudo_lp_conf_power', 0.75),
+                min_purity=self._cfg_get(eval_cfg, 'pseudo_lp_min_purity', 0.0),
+            )
 
-        # Step3: 融合与 cap（优先复用训练期真实 adoption rate）
-        thr = gen._get_dynamic_threshold(eval_epoch) if eval_epoch is not None else self._cfg_get(eval_cfg, 'pseudo_label_threshold', 0.75)
-        fused_labels, fused_conf, pseudo_sources = fuse_pseudo_labels(
-            base_labels, base_conf, glp_labels, glp_conf,
-            observed_labels=train_observed_labels,
-            thr=thr,
-            lp_thr=self._cfg_get(eval_cfg, 'pseudo_lp_threshold', 0.92),
-            conflict_thr=self._cfg_get(eval_cfg, 'pseudo_conflict_threshold', 0.95),
-            conflict_margin=self._cfg_get(eval_cfg, 'pseudo_conflict_margin', 0.15),
-            allow_lp_only=self._cfg_get(eval_cfg, 'pseudo_allow_lp_only', False),
-            lp_agree_bonus=self._cfg_get(eval_cfg, 'pseudo_lp_agree_bonus', 0.0),
-            lp_agree_threshold_offset=self._cfg_get(eval_cfg, 'pseudo_lp_agree_threshold_offset', 0.03),
-            return_sources=True,
-        )
+            thr = gen._get_dynamic_threshold(eval_epoch) if eval_epoch is not None else self._cfg_get(eval_cfg, 'pseudo_label_threshold', 0.75)
+            fused_labels, fused_conf, pseudo_sources = fuse_pseudo_labels(
+                base_labels, base_conf, glp_labels, glp_conf,
+                observed_labels=train_observed_labels,
+                thr=thr,
+                lp_thr=self._cfg_get(eval_cfg, 'pseudo_lp_threshold', 0.92),
+                conflict_thr=self._cfg_get(eval_cfg, 'pseudo_conflict_threshold', 0.95),
+                conflict_margin=self._cfg_get(eval_cfg, 'pseudo_conflict_margin', 0.15),
+                allow_lp_only=self._cfg_get(eval_cfg, 'pseudo_allow_lp_only', False),
+                lp_agree_bonus=self._cfg_get(eval_cfg, 'pseudo_lp_agree_bonus', 0.0),
+                lp_agree_threshold_offset=self._cfg_get(eval_cfg, 'pseudo_lp_agree_threshold_offset', 0.03),
+                return_sources=True,
+            )
+            eval_mode_name = 'teacher/prototype+graph_lp'
+        else:
+            fused_labels = base_labels.copy()
+            fused_conf = base_conf.copy()
+            pseudo_sources = np.full(len(fused_labels), PSEUDO_SOURCE_OBSERVED, dtype=np.int64)
+            eval_unlabeled_mask = train_observed_labels < 0
+            pseudo_sources[eval_unlabeled_mask] = PSEUDO_SOURCE_ABSTAIN
+            pseudo_sources[eval_unlabeled_mask & (fused_labels >= 0)] = PSEUDO_SOURCE_BASE_ONLY
         effective_cap_rate = self._get_last_training_pseudo_cap_rate()
         if effective_cap_rate is None:
             effective_cap_rate = self._cfg_get(eval_cfg, 'pseudo_max_adoption_rate', 1.0)
@@ -1298,6 +1387,14 @@ class TransportModeRecognitionPipeline:
             class_balance_power=float(self._cfg_get(eval_cfg, 'pseudo_class_balance_power', 0.5)),
             min_per_class=int(self._cfg_get(eval_cfg, 'pseudo_class_balance_min_count', 0)),
         )
+        quota = int(self._cfg_get(eval_cfg, 'pseudo_class_quota_per_update', 0))
+        if quota > 0:
+            fused_labels, fused_conf = class_balanced_pseudo_cap(
+                fused_labels,
+                fused_conf,
+                train_observed_labels,
+                quota_per_class=quota,
+            )
         pseudo_sources[(train_observed_labels < 0) & (fused_labels < 0)] = PSEUDO_SOURCE_ABSTAIN
 
         # 只评估被隐藏的样本
@@ -1346,7 +1443,7 @@ class TransportModeRecognitionPipeline:
             }
 
         self.logger.info(
-            f"伪标签质量(融合流程): 隐藏={unlabeled_mask.sum()}, "
+            f"伪标签质量({eval_mode_name}): 隐藏={unlabeled_mask.sum()}, "
             f"采纳={accepted.sum()}({1-abstain_rate:.1%}), "
             f"准确率={acc:.4f}, Macro F1={macro_f1:.4f}, eval_cap={effective_cap_rate:.4f}"
         )
@@ -1417,7 +1514,6 @@ class TransportModeRecognitionPipeline:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
-            self._restore_classifier_runtime_state(checkpoint)
         if self.graph_agg is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         prototypes = checkpoint.get('prototypes', None)
@@ -1706,12 +1802,6 @@ class TransportModeRecognitionPipeline:
             return cfg.get(key, default)
         return getattr(cfg, key, default)
 
-    def _restore_classifier_runtime_state(self, checkpoint: Dict):
-        if getattr(self, 'classifier', None) is None:
-            return
-        if hasattr(self.classifier, 'set_logit_adjustment'):
-            self.classifier.set_logit_adjustment(checkpoint.get('classifier_logit_adjustment'))
-
     def _build_pseudo_label_generator(self, cfg=None):
         """构建与训练阶段一致的伪标签生成器（用于评估）"""
         cfg = self.config.training if cfg is None else cfg
@@ -1727,8 +1817,8 @@ class TransportModeRecognitionPipeline:
             threshold_decay=self._cfg_get(cfg, 'pseudo_threshold_decay', 0.02),
             threshold_decay_interval=self._cfg_get(cfg, 'pseudo_threshold_decay_interval', 10),
             low_margin_penalty=self._cfg_get(cfg, 'pseudo_low_margin_penalty', 0.90),
-            teacher_clf_weight=self._cfg_get(cfg, 'teacher_clf_pseudo_weight', 0.0),
-            proto_weight=self._cfg_get(cfg, 'proto_pseudo_weight', 1.0),
+            teacher_clf_weight=self._cfg_get(cfg, 'teacher_clf_pseudo_weight', self.config.training.teacher_clf_pseudo_weight),
+            proto_weight=self._cfg_get(cfg, 'proto_pseudo_weight', self.config.training.proto_pseudo_weight),
             confidence_floor=self._cfg_get(cfg, 'pseudo_confidence_floor', 0.0),
             distribution_alignment=self._cfg_get(cfg, 'pseudo_distribution_alignment', False),
             distribution_momentum=self._cfg_get(cfg, 'pseudo_distribution_momentum', 0.90),
@@ -1738,6 +1828,7 @@ class TransportModeRecognitionPipeline:
             reliability_gate=self._cfg_get(cfg, 'pseudo_reliability_gate', False),
             reliability_power=self._cfg_get(cfg, 'pseudo_reliability_power', 1.0),
             reliability_floor=self._cfg_get(cfg, 'pseudo_reliability_floor', 0.35),
+            require_teacher_proto_agreement=self._cfg_get(cfg, 'pseudo_require_teacher_proto_agreement', False),
         )
         if name == 'naive':
             return PseudoLabelGenerator(
@@ -2126,7 +2217,518 @@ def parse_args():
         help='是否启用半监督学习 (True/False)'
     )
 
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='随机种子，覆盖 config.data.random_seed'
+    )
+
+    parser.add_argument(
+        '--split-mode',
+        type=str,
+        choices=['user_disjoint', 'sample'],
+        default=None,
+        help='数据划分协议，sample 表示按样本划分，user_disjoint 表示按用户划分'
+    )
+
+    parser.add_argument(
+        '--label-schema',
+        type=str,
+        choices=['ground5', 'geolife5', 'ground4'],
+        default=None,
+        help='标签体系：geolife5=walk/bike/bus/car/subway（train 并入 subway）；ground5=walk/bike/bus/driving/train'
+    )
+
+    parser.add_argument(
+        '--training-profile',
+        type=str,
+        choices=[
+            'baseline',
+            'sampler_only',
+            'hard_only',
+            'coarse_only',
+            'proto_only',
+            'proto_multicenter',
+            'proto_warmup',
+            'proto_multicenter_warmup',
+            'proto_warmup_p015',
+            'proto_warmup_p025',
+            'proto_warmup_early5',
+            'proto_warmup_late15',
+            'proto_warmup_carup_subwaydown',
+            'proto_warmup_teacher_agree',
+            'proto_warmup_teacher_agree_late30',
+            'proto_warmup_teacher_agree_w010',
+            'proto_warmup_teacher_agree_w010_dynquota',
+            'proto_warmup_teacher_agree_w010_proto005',
+            'proto_warmup_teacher_agree_w010_dynquota_proto005',
+            'proto_warmup_teacher_agree_w010_supcon',
+            'proto_warmup_teacher_agree_w010_supcon_lowctr',
+            'proto_warmup_teacher_agree_w010_supcon_dynquota',
+            'proto_warmup_teacher_agree_late30_w010',
+            'proto_warmup_teacher_agree_late30_w010_protoaware',
+            'proto_warmup_teacher_agree_lp',
+            'proto_warmup_teacher_agree_gnn',
+            'proto_warmup_teacher_agree_gnn_lp',
+            'teacher_only',
+            'proto_teacher',
+            'proto_coarse',
+            'proto_teacher_coarse',
+            'supervised_plus',
+            'repr',
+            'teacher_pseudo',
+        ],
+        default=None,
+        help='训练档位：baseline/sampler/hard/coarse/proto/teacher 为筛选档；proto_multicenter/proto_warmup/proto_warmup_* 为 proto 精修档；supervised_plus/repr/teacher_pseudo 为组合档'
+    )
+
+    parser.add_argument(
+        '--clean-supervised-baseline',
+        action='store_true',
+        help='启用干净监督基线：关闭伪标签、图传播、consistency、hard negative、coarse aux，仅保留 encoder + classifier + class-weighted CE'
+    )
+
     return parser.parse_args()
+
+
+def apply_training_profile(config: Config, profile: str):
+    profile = str(profile).lower()
+    tcfg = config.training
+
+    tcfg.clean_supervised_baseline = False
+    tcfg.use_contrastive = False
+    tcfg.use_proto = False
+    tcfg.pseudo_weight = 0.0
+    tcfg.supcon_weight = 0.0
+    tcfg.consistency_weight = 0.0
+    tcfg.pseudo_label_interval = 0
+    tcfg.use_teacher_clf_pseudo = False
+    tcfg.teacher_clf_pseudo_weight = 0.0
+    tcfg.proto_pseudo_weight = 0.0
+    tcfg.lambda_graph_smooth = 0.0
+    tcfg.lambda_graph_contrast = 0.0
+    tcfg.use_ssl_pretrain = False
+    tcfg.use_gnn_aggregation = False
+    tcfg.use_graph_lp = False
+    tcfg.use_stagewise_loss_schedule = False
+    tcfg.classifier_weight_final = tcfg.classifier_weight
+    tcfg.prototypes_per_class = 1
+    tcfg.prototype_per_class_map = {}
+    tcfg.prototype_per_class_map_low_ratio = {}
+    tcfg.use_weighted_sampler = True
+    tcfg.pseudo_supervision_target = 'classifier'
+    tcfg.pseudo_dynamic_class_quota = False
+    tcfg.pseudo_reliability_gate = False
+    config.experiment.use_semi_supervised = False
+    tcfg.training_profile = profile
+
+    def apply_w010_teacher_agree_base():
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.10
+        tcfg.pseudo_label_interval = 5
+        tcfg.pseudo_warmup_epochs = 20
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_dynamic_class_quota = False
+        tcfg.pseudo_class_quota_bootstrap_per_class = 2
+        tcfg.pseudo_class_quota_quality_bins = [0.70, 0.80, 0.90]
+        tcfg.pseudo_class_quota_bin_values = [0, 2, 4, 6]
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        config.experiment.use_semi_supervised = True
+
+    if profile == 'baseline':
+        tcfg.clean_supervised_baseline = True
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+    elif profile == 'sampler_only':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = True
+    elif profile == 'hard_only':
+        tcfg.hard_negative_weight = 0.12
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+    elif profile == 'coarse_only':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.10
+        tcfg.use_weighted_sampler = False
+    elif profile == 'proto_only':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+    elif profile == 'proto_multicenter':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+        tcfg.prototypes_per_class = 1
+        tcfg.prototype_per_class_map = {2: 3, 4: 3}
+    elif profile == 'proto_warmup':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+    elif profile == 'proto_warmup_p015':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.15
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+    elif profile == 'proto_warmup_p025':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.25
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+    elif profile == 'proto_warmup_early5':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 5
+        tcfg.classification_stage_ramp = 15
+    elif profile == 'proto_warmup_late15':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 15
+        tcfg.classification_stage_ramp = 15
+    elif profile == 'proto_warmup_carup_subwaydown':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.class_weights = [1.0, 1.1, 2.0, 1.3, 2.1]
+    elif profile == 'proto_warmup_teacher_agree':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.15
+        tcfg.pseudo_label_interval = 3
+        tcfg.pseudo_warmup_epochs = 20
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_late30':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.15
+        tcfg.pseudo_label_interval = 3
+        tcfg.pseudo_warmup_epochs = 30
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_w010':
+        apply_w010_teacher_agree_base()
+    elif profile == 'proto_warmup_teacher_agree_w010_dynquota':
+        apply_w010_teacher_agree_base()
+        tcfg.pseudo_dynamic_class_quota = True
+    elif profile == 'proto_warmup_teacher_agree_w010_proto005':
+        apply_w010_teacher_agree_base()
+        tcfg.proto_pseudo_weight = 0.05
+    elif profile == 'proto_warmup_teacher_agree_w010_dynquota_proto005':
+        apply_w010_teacher_agree_base()
+        tcfg.pseudo_dynamic_class_quota = True
+        tcfg.proto_pseudo_weight = 0.05
+    elif profile == 'proto_warmup_teacher_agree_w010_supcon':
+        apply_w010_teacher_agree_base()
+        tcfg.supcon_weight = 0.05
+    elif profile == 'proto_warmup_teacher_agree_w010_supcon_lowctr':
+        apply_w010_teacher_agree_base()
+        tcfg.supcon_weight = 0.05
+        tcfg.contrast_weight_final = 0.15
+    elif profile == 'proto_warmup_teacher_agree_w010_supcon_dynquota':
+        apply_w010_teacher_agree_base()
+        tcfg.supcon_weight = 0.05
+        tcfg.contrast_weight_final = 0.15
+        tcfg.pseudo_dynamic_class_quota = True
+    elif profile == 'proto_warmup_teacher_agree_late30_w010':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.10
+        tcfg.pseudo_label_interval = 5
+        tcfg.pseudo_warmup_epochs = 30
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_late30_w010_protoaware':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.10
+        tcfg.pseudo_label_interval = 5
+        tcfg.pseudo_warmup_epochs = 30
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.25
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_dynamic_class_quota = True
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = True
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_lp':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.15
+        tcfg.pseudo_label_interval = 3
+        tcfg.pseudo_warmup_epochs = 20
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        tcfg.use_graph_lp = True
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_gnn':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.15
+        tcfg.pseudo_label_interval = 3
+        tcfg.pseudo_warmup_epochs = 20
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        tcfg.use_gnn_aggregation = True
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_warmup_teacher_agree_gnn_lp':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.pseudo_weight = 0.15
+        tcfg.pseudo_label_interval = 3
+        tcfg.pseudo_warmup_epochs = 20
+        tcfg.pseudo_label_threshold = 0.93
+        tcfg.pseudo_threshold_min = 0.93
+        tcfg.pseudo_progressive_threshold = False
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        tcfg.pseudo_require_teacher_proto_agreement = True
+        tcfg.pseudo_class_quota_per_update = 6
+        tcfg.pseudo_adaptive_per_class = False
+        tcfg.pseudo_distribution_alignment = False
+        tcfg.pseudo_reliability_gate = False
+        tcfg.use_gnn_aggregation = True
+        tcfg.use_graph_lp = True
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_multicenter_warmup':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.0
+        tcfg.proto_weight_final = 0.20
+        tcfg.use_stagewise_loss_schedule = True
+        tcfg.classification_stage_start = 10
+        tcfg.classification_stage_ramp = 15
+        tcfg.prototypes_per_class = 1
+        tcfg.prototype_per_class_map = {2: 3, 4: 3}
+    elif profile == 'teacher_only':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.pseudo_weight = 0.20
+        tcfg.pseudo_label_interval = 3
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_teacher':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.0
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+        tcfg.pseudo_weight = 0.20
+        tcfg.pseudo_label_interval = 3
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        config.experiment.use_semi_supervised = True
+    elif profile == 'proto_coarse':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.10
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+    elif profile == 'proto_teacher_coarse':
+        tcfg.hard_negative_weight = 0.0
+        tcfg.coarse_aux_weight = 0.10
+        tcfg.use_weighted_sampler = False
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+        tcfg.pseudo_weight = 0.20
+        tcfg.pseudo_label_interval = 3
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        config.experiment.use_semi_supervised = True
+    elif profile == 'supervised_plus':
+        tcfg.hard_negative_weight = 0.12
+        tcfg.coarse_aux_weight = 0.10
+    elif profile == 'repr':
+        tcfg.hard_negative_weight = 0.12
+        tcfg.coarse_aux_weight = 0.10
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+    elif profile == 'teacher_pseudo':
+        tcfg.hard_negative_weight = 0.12
+        tcfg.coarse_aux_weight = 0.10
+        tcfg.use_proto = True
+        tcfg.proto_weight = 0.20
+        tcfg.proto_weight_final = 0.20
+        tcfg.pseudo_weight = 0.20
+        tcfg.pseudo_label_interval = 3
+        tcfg.use_teacher_clf_pseudo = True
+        tcfg.teacher_clf_pseudo_weight = 1.0
+        tcfg.proto_pseudo_weight = 0.0
+        config.experiment.use_semi_supervised = True
+    else:
+        raise ValueError(f"Unknown training profile: {profile}")
 
 
 def main():
@@ -2151,9 +2753,21 @@ def main():
     if args.use_semi_supervised is not None:
         config.experiment.use_semi_supervised = args.use_semi_supervised
 
-    # 覆盖半监督开关
-    if args.use_semi_supervised is not None:
-        config.experiment.use_semi_supervised = args.use_semi_supervised
+    if args.seed is not None:
+        config.data.random_seed = int(args.seed)
+
+    if args.split_mode is not None:
+        config.data.split_mode = args.split_mode
+
+    if args.label_schema is not None:
+        config.data.label_schema = args.label_schema
+        config._refresh_label_schema()
+
+    if args.training_profile is not None:
+        apply_training_profile(config, args.training_profile)
+
+    if args.clean_supervised_baseline:
+        apply_training_profile(config, 'baseline')
 
     # 覆盖配置
     if args.exp_name:
@@ -2180,6 +2794,7 @@ def main():
     print(f"运行模式: {args.mode}")
     print(f"实验名称: {config.experiment.exp_name}")
     print(f"GPU设备: {args.gpu}")
+    print(f"训练档位: {config.training.training_profile}")
     print(f"批次大小: {config.training.batch_size}")
     print(f"训练轮数: {config.training.epochs}")
     print(f"数据根目录: {config.data.data_root}")

@@ -130,13 +130,22 @@ class MultiScaleAugmenter(TrajectoryAugmenter):
 
     def _spatial_distortion(self, coords: np.ndarray, length: int) -> np.ndarray:
         """空间扭曲"""
+        if length < 4:
+            return coords
+
         distorted = coords.copy()
         center_idx = np.random.randint(0, length)
-        radius = np.random.randint(5, min(20, length // 2))
+        max_radius = min(20, max(1, length // 2))
+        if max_radius <= 1:
+            return distorted
+        if max_radius <= 5:
+            radius = max_radius
+        else:
+            radius = np.random.randint(5, max_radius + 1)
 
         for i in range(max(0, center_idx - radius), min(length, center_idx + radius)):
             distance = abs(i - center_idx)
-            distortion_strength = (1 - distance / radius) * 0.001
+            distortion_strength = (1 - distance / max(radius, 1)) * 0.001
             distorted[i] += np.random.normal(0, distortion_strength, coords.shape[1])
 
         return distorted

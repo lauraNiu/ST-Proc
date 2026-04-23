@@ -17,15 +17,20 @@ class DataConfig:
     max_len: int = 200
     test_size: float = 0.2
     random_seed: int = 42
+    split_mode: str = 'sample'   # 'sample' | 'user_disjoint'
+    label_schema: str = 'geolife5'       # 'geolife5' | 'ground5' | 'ground4'
     # 标签控制参数
     labeled_ratio: float = 0.2  # 训练时可见标签的比例 (0.0-1.0)
     only_labeled_users: bool = False
     include_real_unlabeled_in_train: bool = False  # benchmark 默认关闭；仅显式开启 real-world SSL 时并入真实无标签用户
     require_valid_label: bool = False
-    min_samples_per_class: int = 10  # 每类至少保留的样本数
+    min_samples_per_class: int = 20  # 每类至少保留的可见标签样本数
     min_label_overlap: float = 0.35
-
-
+    segment_by_label: bool = True
+    min_segment_points: int = 2
+    min_label_purity: float = 0.0
+    drop_mixed_segments: bool = False
+    keep_unlabeled_segments: bool = False
 
     def get(self, key: str, default=None):
         """字典式访问"""
@@ -36,7 +41,7 @@ class ModelConfig:
     """模型配置"""
     hidden_dim: int = 256
     projection_dim: int = 128
-    feat_dim: int = 54
+    feat_dim: int = 82
     coord_dim: int = 4
     dropout: float = 0.2
     num_encoder_layers: int = 3
@@ -51,26 +56,28 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """训练配置"""
+    training_profile: str = 'teacher_pseudo'  # 'baseline' | 'supervised_plus' | 'repr' | 'teacher_pseudo'
     batch_size: int = 64
     epochs: int = 200
     lr: float = 0.0003
     weight_decay: float = 1e-4
     temperature: float = 0.07
-    contrast_weight: float = 1.0
-    proto_weight: float = 1.0
-    pseudo_weight: float = 1.0          # 提高伪标签损失权重
-    consistency_weight: float = 0.1
+    contrast_weight: float = 0.0
+    supcon_weight: float = 0.0
+    proto_weight: float = 0.0
+    pseudo_weight: float = 0.3
+    consistency_weight: float = 0.0
     patience: int = 40
     min_delta: float = 1e-4
-    pseudo_label_interval: int = 2
-    pseudo_label_threshold: float = 0.75
+    pseudo_label_interval: int = 5
+    pseudo_label_threshold: float = 0.88
     pseudo_progressive_threshold: bool = False  # 默认关闭后期放松阈值
-    pseudo_threshold_min: float = 0.75     # 关闭 progressive 时保持与主阈值一致
+    pseudo_threshold_min: float = 0.86     # 关闭 progressive 时保持较保守但可落地的门槛
     pseudo_threshold_decay: float = 0.00   # 保守模式下默认不衰减
     pseudo_threshold_decay_interval: int = 10
-    pseudo_confidence_temperature: float = 0.10   # 收尖原型概率，使高置信样本能通过阈值
-    pseudo_low_margin_penalty: float = 0.95       # 轻微放松 low-margin 惩罚，但仍保留边界样本抑制
-    pseudo_max_adoption_rate: float = 0.25        # 每次更新最多采纳 25% 的无标签样本
+    pseudo_confidence_temperature: float = 0.30
+    pseudo_low_margin_penalty: float = 0.90
+    pseudo_max_adoption_rate: float = 0.08
     pseudo_max_adoption_count: int = 0            # 0 表示仅按比例上限裁剪
     pseudo_lp_threshold: float = 0.92             # LP-only 分支显著更严格
     pseudo_conflict_threshold: float = 0.95       # 冲突时只允许极高置信的一方胜出
@@ -80,15 +87,15 @@ class TrainingConfig:
     pseudo_lp_max_adoption_rate: float = 0.05     # LP-only 最多占无标签池 5%
     pseudo_lp_agree_bonus: float = 0.03           # base 与 LP 一致时给 LP 轻微置信度加成
     lp_min_support: float = 0.55                  # 小幅放松 LP 支撑门槛，仅帮助 agreement 样本形成
-    use_contrastive: bool = True
-    use_proto: bool = True
+    use_contrastive: bool = False
+    use_proto: bool = False
     pseudo_label_generator: str = 'advanced'
-    pseudo_warmup_epochs: int = 3          # 更短的 warmup，尽早开始利用伪标签
+    pseudo_warmup_epochs: int = 10
     pseudo_ramp_epochs: int = 30
     consistency_ramp_epochs: int = 30
     graph_k: int = 15
-    lambda_graph_smooth: float = 0.10
-    lambda_graph_contrast: float = 0.20
+    lambda_graph_smooth: float = 0.0
+    lambda_graph_contrast: float = 0.0
     graph_build_interval: int = 1
     lp_alpha: float = 0.95
     lp_iters: int = 20
@@ -106,7 +113,7 @@ class TrainingConfig:
     pseudo_quality_relax_threshold: float = 0.93  # 历史 precision 足够高时才允许放松 hard class 阈值
     pseudo_quality_strict_threshold: float = 0.85 # 历史 precision 偏低时主动收紧 hard class 阈值
     pseudo_quality_strict_scale: float = 0.20     # 低质量 hard class 的额外阈值增量缩放
-    pseudo_hard_class_extra_strictness: Dict[int, float] = field(default_factory=lambda: {2: 0.03, 4: 0.05})
+    pseudo_hard_class_extra_strictness: Dict[int, float] = field(default_factory=lambda: {2: 0.02, 4: 0.03})
     pseudo_distribution_alignment: bool = True
     pseudo_distribution_momentum: float = 0.90
     pseudo_distribution_min_prob: float = 1e-3
@@ -119,18 +126,21 @@ class TrainingConfig:
     pseudo_lp_agree_threshold_offset: float = 0.03
     pseudo_lp_conf_power: float = 0.75
     pseudo_lp_min_purity: float = 0.65
-    lp_graph_temperature: float = 0.20
-    lp_mutual_knn: bool = True
-    lp_seed_weight: float = 0.35
-    lp_entropy_weight: float = 0.20
-    lp_neighbor_agreement_weight: float = 0.25
 
     low_ratio_cutoff: float = 0.10
-    mid_ratio_cutoff: float = 0.30
-    low_ratio_pseudo_warmup_epochs: int = 18
-    low_ratio_pseudo_label_interval: int = 5
-    low_ratio_initial_pseudo_max_adoption_rate: float = 0.05
-    low_ratio_target_pseudo_max_adoption_rate: float = 0.12
+    mid_ratio_cutoff: float = 0.20
+    mid_ratio_pseudo_warmup_epochs: int = 8
+    mid_ratio_pseudo_label_interval: int = 3
+    mid_ratio_pseudo_label_threshold: float = 0.87
+    mid_ratio_pseudo_threshold_min: float = 0.84
+    mid_ratio_initial_pseudo_max_adoption_rate: float = 0.10
+    mid_ratio_target_pseudo_max_adoption_rate: float = 0.16
+    low_ratio_pseudo_warmup_epochs: int = 6
+    low_ratio_pseudo_label_interval: int = 2
+    low_ratio_pseudo_label_threshold: float = 0.85
+    low_ratio_pseudo_threshold_min: float = 0.82
+    low_ratio_initial_pseudo_max_adoption_rate: float = 0.12
+    low_ratio_target_pseudo_max_adoption_rate: float = 0.20
     low_ratio_cap_ramp_epochs: int = 30
     low_ratio_cap_ramp_min_quality: float = 0.88
     low_ratio_cap_ramp_max_quality: float = 0.94
@@ -138,27 +148,22 @@ class TrainingConfig:
     low_ratio_hard_negative_weight_scale: float = 0.35
     low_ratio_coarse_aux_weight_scale: float = 0.50
     low_ratio_aux_ramp_epochs: int = 35
-    mid_ratio_initial_pseudo_max_adoption_rate: float = 0.15
-    mid_ratio_target_pseudo_max_adoption_rate: float = 0.20
-    mid_ratio_pseudo_warmup_epochs: int = 10
-    mid_ratio_pseudo_label_interval: int = 3
 
     prototype_stage_low_ratio_cutoff: float = 0.10
     prototype_per_class_map_low_ratio: Dict[int, int] = field(default_factory=lambda: {2: 3, 4: 3})
     prototype_expand_epoch: int = 28
     prototype_expand_quality_thr: float = 0.92
 
-    use_ssl_pretrain: bool = True
-    pretrain_epochs: int = 20
-    low_ratio_pretrain_epochs: int = 30
+    use_ssl_pretrain: bool = False
+    pretrain_epochs: int = 0
     pretrain_lr: float = 3e-4
     pretrain_weight_decay: float = 1e-4
     pretrain_graph_smooth_weight: float = 0.05
     pretrain_graph_contrast_weight: float = 0.10
 
     proto_margin: float = 0.10
-    # walk(0)/bike(1)/bus(2)/car(3)/subway(4)
-    class_weights: Optional[List[float]] = field(default_factory=lambda: [1.0, 1.2, 2.5, 1.0, 3.5])
+    # walk(0)/bike(1)/bus(2)/car(3)/subway(4); subway 含原始 train
+    class_weights: Optional[List[float]] = field(default_factory=lambda: [1.0, 1.1, 2.0, 1.0, 2.4])
 
     # 默认不再主动下调某些类别门槛，避免 bus/car/subway 被过量放行
     pseudo_per_class_thresholds: Dict[int, float] = field(default_factory=dict)
@@ -168,21 +173,13 @@ class TrainingConfig:
     classifier_weight: float = 1.0
     classifier_weight_final: float = 1.6
     classifier_label_smoothing: float = 0.03
-    classifier_hidden_dim: int = 256
-    use_hierarchical_classifier: bool = True
-    hierarchical_prior_scale: float = 0.70
-    use_effective_class_balancing: bool = True
-    class_balance_beta: float = 0.999
-    class_balance_weight_power: float = 1.0
-    class_balance_max_weight: float = 6.0
-    use_logit_adjustment: bool = True
-    logit_adjust_tau: float = 1.0
     prototypes_per_class: int = 3
     prototype_per_class_map: Dict[int, int] = field(default_factory=lambda: {2: 5, 4: 6})
     prototype_pooling: str = 'logsumexp'
     prototype_pool_temperature: float = 0.35
     proto_weight_final: float = 0.70
     contrast_weight_final: float = 0.25
+    supcon_temperature: float = 0.07
     graph_weight_final: float = 0.35
     use_stagewise_loss_schedule: bool = True
     classification_stage_start: int = 20
@@ -193,18 +190,28 @@ class TrainingConfig:
     full_label_consistency_weight: float = 0.0
     full_label_lambda_graph_smooth: float = 0.0
     full_label_lambda_graph_contrast: float = 0.0
+    clean_supervised_baseline: bool = False
 
     # Teacher classifier 主导伪标签生成
     use_teacher_clf_pseudo: bool = True           # 用 teacher classifier 主导伪标签生成
-    teacher_clf_pseudo_weight: float = 0.7        # teacher clf 置信度权重
-    proto_pseudo_weight: float = 0.3              # prototype 置信度权重（辅助）
-    pseudo_class_quota_per_update: int = 0        # 0=不限，>0 则每类最多采纳 N 个
+    teacher_clf_pseudo_weight: float = 1.0
+    proto_pseudo_weight: float = 0.0
+    pseudo_require_teacher_proto_agreement: bool = False
+    pseudo_class_quota_per_update: int = 24
+    pseudo_dynamic_class_quota: bool = False
+    pseudo_class_quota_quality_floor: float = 0.78
+    pseudo_class_quota_bootstrap_per_class: int = 2
+    pseudo_class_quota_quality_bins: List[float] = field(default_factory=lambda: [0.70, 0.80, 0.90])
+    pseudo_class_quota_bin_values: List[int] = field(default_factory=lambda: [0, 2, 4, 6])
     patience_after_pseudo: int = 20               # 伪标签激活后额外保护 epoch 数
+    pseudo_supervision_target: str = 'classifier'  # 'classifier' | 'prototype' | 'both'
 
     # GNN 聚合层
-    use_gnn_aggregation: bool = True              # 在 encoder 输出后应用 GAT 图聚合
+    use_gnn_aggregation: bool = False
+    use_graph_lp: bool = False
 
     # 采样器
+    use_weighted_sampler: bool = True
     sampler_unlabeled_weight: float = 0.20
     sampler_class_balance_power: float = 0.60
     sampler_min_class_weight: float = 0.05
@@ -214,9 +221,10 @@ class TrainingConfig:
     # 难类判别增强
     hard_negative_pairs: List[List[int]] = field(default_factory=lambda: [[2, 4], [2, 3]])
     hard_negative_margin: float = 0.25
-    hard_negative_weight: float = 0.20
+    hard_negative_weight: float = 0.12
     coarse_groups: List[List[int]] = field(default_factory=lambda: [[0, 1], [2, 3], [4]])
-    coarse_aux_weight: float = 0.15
+    coarse_aux_weight: float = 0.10
+    reset_patience_on_pseudo_adoption: bool = True
 
     def get(self, key: str, default=None):
         """字典式访问"""
@@ -261,7 +269,6 @@ class Config:
 
         self._setup_paths()
         # GeoLife 数据集的标准标签映射
-        # 原始标签映射
         self.original_label_mapping = {
             'walk': 0,
             'bike': 1,
@@ -275,21 +282,8 @@ class Config:
             'motorcycle': 9,
             'taxi': 10
         }
-
-        # 标签合并映射（原始标签ID -> 新标签ID）
-        self.label_mapping = {
-            0: 0,  # walk -> walk
-            1: 1,  # bike -> bike
-            2: 2,  # bus -> bus
-            3: 3,  # car -> car
-            4: 4,  # subway -> subway
-            5: -1,  # train -> 排除
-            6: -1,  # airplane -> 排除
-            7: -1,  # boat -> 排除
-            8: -1,  # run -> 排除
-            9: -1,  # motorcycle -> 排除
-            10: 3  # taxi -> car (合并)
-        }
+        self.label_mapping = {}
+        self._refresh_label_schema()
 
     def _setup_paths(self):
         """设置实验路径"""
@@ -323,6 +317,7 @@ class Config:
             setattr(self.training, key, value)
         for key, value in config_dict.get('experiment', {}).items():
             setattr(self.experiment, key, value)
+        self._refresh_label_schema()
 
     def save(self, save_path: str):
         """保存配置到文件"""
@@ -358,33 +353,94 @@ class Config:
                 return getattr(section, key)
         return default
 
+    def _label_schema_specs(self) -> Dict[str, Dict[str, Dict[int, int]]]:
+        return {
+            'ground5': {
+                'label_names': {
+                    0: 'walk',
+                    1: 'bike',
+                    2: 'bus',
+                    3: 'driving',
+                    4: 'train'
+                },
+                'mapping': {
+                    0: 0,
+                    1: 1,
+                    2: 2,
+                    3: 3,
+                    4: -1,
+                    5: 4,
+                    6: -1,
+                    7: -1,
+                    8: -1,
+                    9: -1,
+                    10: 3,
+                }
+            },
+            'geolife5': {
+                'label_names': {
+                    0: 'walk',
+                    1: 'bike',
+                    2: 'bus',
+                    3: 'car',
+                    4: 'subway'
+                },
+                'mapping': {
+                    0: 0,
+                    1: 1,
+                    2: 2,
+                    3: 3,
+                    4: 4,
+                    5: 4,
+                    6: -1,
+                    7: -1,
+                    8: -1,
+                    9: -1,
+                    10: 3,
+                }
+            },
+            'ground4': {
+                'label_names': {
+                    0: 'walk',
+                    1: 'bike',
+                    2: 'bus',
+                    3: 'driving'
+                },
+                'mapping': {
+                    0: 0,
+                    1: 1,
+                    2: 2,
+                    3: 3,
+                    4: -1,
+                    5: -1,
+                    6: -1,
+                    7: -1,
+                    8: -1,
+                    9: -1,
+                    10: 3,
+                }
+            }
+        }
+
+    def _refresh_label_schema(self):
+        schema = getattr(self.data, 'label_schema', 'geolife5')
+        specs = self._label_schema_specs()
+        if schema not in specs:
+            raise ValueError(f'Unsupported label schema: {schema}')
+        spec = specs[schema]
+        self.label_mapping = dict(spec['mapping'])
+        self.experiment.num_classes = len(spec['label_names'])
+
     @property
     def label_names(self) -> Dict[int, str]:
-        """交通方式标签名称 - 合并后的版本"""
-        return {
-            0: 'walk',
-            1: 'bike',
-            2: 'bus',
-            3: 'car',  # 合并了car和taxi
-            4: 'subway'
-        }
+        """交通方式标签名称 - 按 schema 动态返回"""
+        schema = getattr(self.data, 'label_schema', 'geolife5')
+        return dict(self._label_schema_specs()[schema]['label_names'])
 
     @property
     def original_to_merged_labels(self) -> Dict[int, int]:
         """原始标签到合并标签的映射"""
-        return {
-            0: 0,  # walk -> walk
-            1: 1,  # bike -> bike
-            2: 2,  # bus -> bus
-            3: 3,  # car -> car
-            4: 4,  # subway -> subway
-            5: -1,  # train -> 忽略
-            6: -1,  # airplane -> 忽略
-            7: -1,  # boat -> 忽略
-            8: -1,  # run -> 忽略
-            9: -1,  # motorcycle -> 忽略
-            10: 3  # taxi -> car (合并)
-        }
+        return dict(self.label_mapping)
 
     @property
     def exp_dir(self):
@@ -401,5 +457,3 @@ class Config:
     @property
     def result_dir(self):
         return self._result_dir
-
-

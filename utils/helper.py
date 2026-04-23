@@ -170,12 +170,13 @@ class MetricsTracker:
         return dict(self.metrics)
 
 
-def set_seed(seed: int = 42):
+def set_seed(seed: int = 42, deterministic: bool = True):
     """
     设置随机种子以确保结果可复现
 
     Args:
         seed: 随机种子
+        deterministic: 是否启用确定性算法
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -183,14 +184,36 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # 确保CUDA操作的确定性
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
     # 设置环境变量
     os.environ['PYTHONHASHSEED'] = str(seed)
+    if deterministic:
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception as e:
+            print(f"⚠️ deterministic algorithms enable failed: {e}")
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
-    print(f"🌱 随机种子已设置: {seed}")
+    print(f"🌱 随机种子已设置: {seed} | deterministic={deterministic}")
+
+
+def seed_worker(worker_id: int):
+    """为 DataLoader worker 设置确定性随机种子。"""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+
+def create_torch_generator(seed: int) -> torch.Generator:
+    """创建带固定种子的 torch.Generator。"""
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    return g
 
 
 def make_json_serializable(obj: Any) -> Any:

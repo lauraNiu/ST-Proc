@@ -26,6 +26,7 @@ from .loss import (
     ConsistencyLoss,
     GraphSmoothnessLoss,
     NeighborContrastiveLoss,
+    SupConLoss,
     compute_prototype_logits,
 )
 from training.pseudo_label import (
@@ -121,6 +122,10 @@ class Trainer:
         self.contrast_loss_fn = ContrastiveLoss(
             temperature=config.get('temperature', 0.07)
         )
+        self.supcon_loss_fn = SupConLoss(
+            temperature=float(config.get('supcon_temperature', config.get('temperature', 0.07))),
+            device=str(self.device),
+        )
         self.prototype_pooling = str(config.get('prototype_pooling', 'max')).lower()
         self.prototype_pool_temperature = float(config.get('prototype_pool_temperature', 1.0))
         self.proto_loss_fn = PrototypicalLoss(
@@ -157,6 +162,7 @@ class Trainer:
 
         # Loss weights
         self.contrast_weight = float(config.get('contrast_weight', 1.0))
+        self.supcon_weight = float(config.get('supcon_weight', 0.0))
         self.proto_weight = float(config.get('proto_weight', 0.5))
         self.classifier_weight_final = float(config.get('classifier_weight_final', self.classifier_weight))
         self.contrast_weight_final = float(config.get('contrast_weight_final', self.contrast_weight))
@@ -196,6 +202,7 @@ class Trainer:
             'train_loss': [],
             'val_loss': [],
             'contrast_loss': [],
+            'supcon_loss': [],
             'proto_loss': [],
             'ce_loss': [],
             'hard_negative_loss': [],
@@ -207,6 +214,12 @@ class Trainer:
 
         self.logger.info(f"Trainer initialized with config: {config}")
         self.logger.info(f"Model parameters: {self._count_parameters():,}")
+
+    def _label_names(self) -> Dict[int, str]:
+        names = self.config.get('label_names', {}) or {}
+        if isinstance(names, dict) and names:
+            return {int(k): str(v) for k, v in names.items()}
+        return {cls: str(cls) for cls in range(self.num_classes)}
 
     def _build_optimizer(self) -> optim.Optimizer:
         """Build optimizer."""
@@ -313,6 +326,32 @@ class Trainer:
     def _current_contrast_weight(self) -> float:
         return self._stage_interp(self.contrast_weight, self.contrast_weight_final)
 
+    def _current_supcon_weight(self) -> float:
+        return float(self.supcon_weight)
+
+    def _compute_supcon_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if self.supcon_weight <= 0.0 or features.numel() == 0 or labels.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+        valid_mask = labels >= 0
+        if valid_mask.sum() < 2:
+            return torch.tensor(0.0, device=self.device)
+        features = features[valid_mask]
+        labels = labels[valid_mask]
+        if features.size(0) < 2:
+            return torch.tensor(0.0, device=self.device)
+
+        # SupCon 需要至少存在一个“同类正样本对”，否则直接跳过。
+        uniq, counts = torch.unique(labels, return_counts=True)
+        positive_classes = uniq[counts >= 2]
+        if positive_classes.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+        pair_mask = torch.zeros_like(labels, dtype=torch.bool)
+        for cls in positive_classes:
+            pair_mask |= (labels == cls)
+        if pair_mask.sum() < 2:
+            return torch.tensor(0.0, device=self.device)
+        return self.supcon_loss_fn(features[pair_mask], labels[pair_mask])
+
     def _current_proto_weight(self) -> float:
         return self._stage_interp(self.proto_weight, self.proto_weight_final)
 
@@ -380,77 +419,6 @@ class Trainer:
         sample_w = w[labels]
         return sample_w / sample_w.mean().clamp_min(1e-6)
 
-    def _infer_train_label_counts(self) -> np.ndarray:
-        counts = np.zeros(self.num_classes, dtype=np.float64)
-        dataset = getattr(self.train_loader, 'dataset', None)
-        trajs = getattr(dataset, 'trajs', None)
-        if trajs is None:
-            return counts
-        for traj in trajs:
-            label = traj.get('label', -1)
-            if label is None:
-                continue
-            label = int(label)
-            if 0 <= label < self.num_classes:
-                counts[label] += 1
-        return counts
-
-    def _compute_effective_class_weights(self, counts: np.ndarray) -> torch.Tensor:
-        if not bool(self.config.get('use_effective_class_balancing', True)):
-            return torch.ones(self.num_classes, dtype=torch.float32)
-        beta = float(self.config.get('class_balance_beta', 0.999))
-        power = float(self.config.get('class_balance_weight_power', 1.0))
-        max_weight = float(self.config.get('class_balance_max_weight', 6.0))
-        weights = np.ones(self.num_classes, dtype=np.float64)
-        pos_mask = counts > 0
-        if pos_mask.any():
-            effective_num = 1.0 - np.power(beta, counts[pos_mask])
-            weights[pos_mask] = (1.0 - beta) / np.clip(effective_num, 1e-12, None)
-        weights = np.power(weights, power)
-        weights = np.clip(weights, 1e-3, max_weight)
-        mean_ref = weights[pos_mask].mean() if pos_mask.any() else weights.mean()
-        weights = weights / max(float(mean_ref), 1e-6)
-        return torch.tensor(weights, dtype=torch.float32)
-
-    def _compute_coarse_class_weights(self, fine_weights: torch.Tensor) -> Optional[torch.Tensor]:
-        if not self.coarse_groups:
-            return None
-        vals = []
-        for group in self.coarse_groups:
-            group_vals = [fine_weights[int(cls)] for cls in group if 0 <= int(cls) < fine_weights.numel()]
-            if group_vals:
-                vals.append(torch.stack(group_vals).mean())
-            else:
-                vals.append(torch.tensor(1.0, dtype=fine_weights.dtype, device=fine_weights.device))
-        coarse = torch.stack(vals)
-        return coarse / coarse.mean().clamp_min(1e-6)
-
-    def _compute_logit_adjustment(self, counts: np.ndarray) -> torch.Tensor:
-        if not bool(self.config.get('use_logit_adjustment', True)):
-            return torch.zeros(self.num_classes, dtype=torch.float32)
-        tau = float(self.config.get('logit_adjust_tau', 1.0))
-        if counts.sum() <= 0:
-            prior = np.full(self.num_classes, 1.0 / max(self.num_classes, 1), dtype=np.float64)
-        else:
-            prior = counts / counts.sum()
-        prior = np.clip(prior, 1e-8, 1.0)
-        adjustment = tau * np.log(prior)
-        adjustment = adjustment - adjustment.mean()
-        return torch.tensor(adjustment, dtype=torch.float32)
-
-    def _forward_classifier(self, h: torch.Tensor, return_aux: bool = False):
-        if self.classifier is None:
-            return None
-        try:
-            outputs = self.classifier(h, return_aux=return_aux)
-        except TypeError:
-            outputs = self.classifier(h)
-        if isinstance(outputs, dict):
-            return outputs if return_aux else outputs.get('logits')
-        if return_aux:
-            return {'logits': outputs, 'fine_logits': outputs, 'coarse_logits': None, 'features': h}
-        return outputs
-
     def _prototype_count_for_class(self, class_id: int) -> int:
         class_id = int(class_id)
         if not (0 <= class_id < len(self.class_prototype_counts)):
@@ -501,28 +469,16 @@ class Trainer:
             return torch.tensor(0.0, device=self.device)
         return torch.cat(losses).mean()
 
-    def _compute_coarse_aux_loss(
-            self,
-            logits: torch.Tensor,
-            labels: torch.Tensor,
-            coarse_logits: torch.Tensor = None
-    ) -> torch.Tensor:
+    def _compute_coarse_aux_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.coarse_aux_weight <= 0.0 or logits.numel() == 0 or not self.coarse_groups:
             return torch.tensor(0.0, device=self.device)
-        coarse_targets = torch.tensor(
-            [self.fine_to_coarse[int(v)] for v in labels.detach().cpu().tolist()],
-            device=labels.device
-        )
-        coarse_weight = self.coarse_class_weight_tensor
-        if coarse_weight is not None:
-            coarse_weight = coarse_weight.to(labels.device)
-        if coarse_logits is None:
-            coarse_logits_parts = []
-            for group in self.coarse_groups:
-                idx = torch.tensor(group, device=logits.device, dtype=torch.long)
-                coarse_logits_parts.append(torch.logsumexp(logits[:, idx], dim=1))
-            coarse_logits = torch.stack(coarse_logits_parts, dim=1)
-        return F.cross_entropy(coarse_logits, coarse_targets, weight=coarse_weight)
+        coarse_logits = []
+        for group in self.coarse_groups:
+            idx = torch.tensor(group, device=logits.device, dtype=torch.long)
+            coarse_logits.append(torch.logsumexp(logits[:, idx], dim=1))
+        coarse_logits = torch.stack(coarse_logits, dim=1)
+        coarse_targets = torch.tensor([self.fine_to_coarse[int(v)] for v in labels.detach().cpu().tolist()], device=labels.device)
+        return F.cross_entropy(coarse_logits, coarse_targets)
 
     def _update_pseudo_quality_ema(self, per_class_monitor: Dict[int, Dict[str, float]]):
         momentum = float(self.config.get('pseudo_quality_momentum', 0.7))
@@ -538,7 +494,7 @@ class Trainer:
                 self.pseudo_class_precision_ema[cls] = float(momentum * prev + (1.0 - momentum) * acc)
 
     def _build_pseudo_monitor(self, observed_labels, pseudo_labels, confidences, pseudo_sources) -> Dict[int, Dict[str, float]]:
-        label_names = {0: 'walk', 1: 'bike', 2: 'bus', 3: 'car', 4: 'subway'}
+        label_names = self._label_names()
         unlabeled_mask = observed_labels < 0
         adopted_mask = unlabeled_mask & (pseudo_labels >= 0)
         hidden_mask = None
@@ -697,7 +653,7 @@ class Trainer:
                     )
             pseudo_label_generator.class_reliability = reliability
 
-        label_names = {0: 'walk', 1: 'bike', 2: 'bus', 3: 'car', 4: 'subway'}
+        label_names = self._label_names()
         thr_str = ', '.join(
             f"{label_names.get(cls, cls)}:{per_class_thr[cls]:.3f}/{per_class_margin[cls]:.3f}"
             for cls in range(self.num_classes) if cls in per_class_thr
@@ -1150,8 +1106,7 @@ class Trainer:
                 )
 
                 if getattr(self, 'classifier', None) is not None and hasattr(self, 'ce_loss_fn'):
-                    clf_outputs = self._forward_classifier(emb[labeled_mask], return_aux=True)
-                    logits = clf_outputs['logits']
+                    logits = self.classifier(emb[labeled_mask])
                     ce_loss = self.ce_loss_fn(logits, labels[labeled_mask])
                 else:
                     logits = compute_prototype_logits(
@@ -1288,8 +1243,6 @@ class Trainer:
         # 保存分类头（如果存在）
         if hasattr(self, 'classifier') and self.classifier is not None:
             checkpoint['classifier_state_dict'] = self.classifier.state_dict()
-            if hasattr(self.classifier, 'logit_adjustment'):
-                checkpoint['classifier_logit_adjustment'] = self.classifier.logit_adjustment.detach().cpu()
         if getattr(self, 'graph_agg', None) is not None:
             checkpoint['graph_agg_state_dict'] = self.graph_agg.state_dict()
 
@@ -1312,8 +1265,6 @@ class Trainer:
         self.projector.load_state_dict(checkpoint['projector_state_dict'])
         if getattr(self, 'classifier', None) is not None and 'classifier_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['classifier_state_dict'])
-            if hasattr(self.classifier, 'set_logit_adjustment'):
-                self.classifier.set_logit_adjustment(checkpoint.get('classifier_logit_adjustment'))
         if getattr(self, 'graph_agg', None) is not None and 'graph_agg_state_dict' in checkpoint:
             self.graph_agg.load_state_dict(checkpoint['graph_agg_state_dict'])
         self.prototypes = checkpoint['prototypes'].to(self.device)
@@ -1359,22 +1310,10 @@ class SemiSupervisedTrainer(Trainer):
         self.classifier = classifier
         self.classifier_weight = float(self.config.get('classifier_weight', 1.0))
         self.classifier_weight_final = float(self.config.get('classifier_weight_final', self.classifier_weight))
-        manual_cw = self.config.get('class_weights', None)
-        if manual_cw is not None:
-            manual_cw_t = torch.tensor(manual_cw, dtype=torch.float32, device=self.device)
-        else:
-            manual_cw_t = torch.ones(self.num_classes, dtype=torch.float32, device=self.device)
-
-        self.train_label_counts = self._infer_train_label_counts()
-        effective_cw_t = self._compute_effective_class_weights(self.train_label_counts).to(self.device)
-        combined_cw = manual_cw_t * effective_cw_t
-        combined_cw = combined_cw / combined_cw.mean().clamp_min(1e-6)
-        self.class_weight_tensor = combined_cw
-        self.coarse_class_weight_tensor = self._compute_coarse_class_weights(combined_cw)
-
+        cw = self.config.get('class_weights', None)
+        cw_t = torch.tensor(cw, dtype=torch.float32).to(self.device) if cw is not None else None
         label_smoothing = float(self.config.get('classifier_label_smoothing', 0.0))
-        self.ce_loss_fn = nn.CrossEntropyLoss(weight=self.class_weight_tensor, label_smoothing=label_smoothing)
-        self.logit_adjustment = self._compute_logit_adjustment(self.train_label_counts).to(self.device)
+        self.ce_loss_fn = nn.CrossEntropyLoss(weight=cw_t, label_smoothing=label_smoothing)
 
         use_gnn = self.config.get('use_gnn_aggregation', True)
         if use_gnn:
@@ -1412,10 +1351,6 @@ class SemiSupervisedTrainer(Trainer):
             self.teacher_classifier = copy.deepcopy(classifier).to(self.device)
             for p in self.teacher_classifier.parameters():
                 p.requires_grad = False
-            if hasattr(self.classifier, 'set_logit_adjustment'):
-                self.classifier.set_logit_adjustment(self.logit_adjustment)
-            if hasattr(self.teacher_classifier, 'set_logit_adjustment'):
-                self.teacher_classifier.set_logit_adjustment(self.logit_adjustment)
         else:
             self.teacher_classifier = None
 
@@ -1519,6 +1454,7 @@ class SemiSupervisedTrainer(Trainer):
         # 对比损失（视图）
         contrast_loss = self.contrast_loss_fn(z1, z2)
         labeled_mask = labels >= 0
+        supcon_loss = self._compute_supcon_loss(z1, labels)
         proto_loss = torch.tensor(0.0, device=self.device)
         if labeled_mask.sum() > 0:
             proto_loss = self.proto_loss_fn(z1[labeled_mask], labels[labeled_mask], self.prototypes)
@@ -1528,15 +1464,10 @@ class SemiSupervisedTrainer(Trainer):
         hard_negative_loss = torch.tensor(0.0, device=self.device)
         coarse_loss = torch.tensor(0.0, device=self.device)
         if self.classifier is not None and labeled_mask.sum() > 0:
-            clf_outputs = self._forward_classifier(emb1[labeled_mask], return_aux=True)
-            logits = clf_outputs['logits']
+            logits = self.classifier(emb1[labeled_mask])
             ce_loss = self.ce_loss_fn(logits, labels[labeled_mask])
             hard_negative_loss = self._compute_hard_negative_loss(logits, labels[labeled_mask])
-            coarse_loss = self._compute_coarse_aux_loss(
-                logits,
-                labels[labeled_mask],
-                coarse_logits=clf_outputs.get('coarse_logits')
-            )
+            coarse_loss = self._compute_coarse_aux_loss(logits, labels[labeled_mask])
 
         # 伪标签损失
         pseudo_loss = torch.tensor(0.0, device=self.device)
@@ -1578,6 +1509,7 @@ class SemiSupervisedTrainer(Trainer):
                 self._current_hard_negative_weight() * hard_negative_loss +
                 self._current_coarse_aux_weight() * coarse_loss +
                 self._current_contrast_weight() * contrast_loss +
+                self._current_supcon_weight() * supcon_loss +
                 self._current_proto_weight() * proto_loss +
                 self._current_pseudo_weight() * pseudo_loss +
                 self._current_consistency_weight() * consistency_loss +
@@ -1589,6 +1521,7 @@ class SemiSupervisedTrainer(Trainer):
             'total_loss_tensor': total_loss,
             'total_loss': total_loss.item(),
             'contrast_loss': contrast_loss.item(),
+            'supcon_loss': supcon_loss.item(),
             'proto_loss': proto_loss.item(),
             'pseudo_loss': pseudo_loss.item(),
             'consistency_loss': consistency_loss.item(),
@@ -1728,24 +1661,26 @@ class SemiSupervisedTrainer(Trainer):
         pseudo_labels_tensor = torch.LongTensor(batch_pseudo_labels[pseudo_mask]).to(self.device)
         pseudo_conf_tensor = torch.FloatTensor(batch_pseudo_confs[pseudo_mask]).to(self.device)
         pseudo_z = embeddings[pseudo_mask_t]
+        supervision_target = str(self.config.get('pseudo_supervision_target', 'both')).lower()
 
-        # Prototype 头 pseudo loss
-        logits = compute_prototype_logits(
-            pseudo_z,
-            self.prototypes,
-            temperature=self.config.get('temperature', 0.07),
-            aggregation=self.prototype_pooling,
-            pool_temperature=self.prototype_pool_temperature,
-        )
         sample_class_w = self._get_class_sample_weights(pseudo_labels_tensor)
-        per_sample_loss = F.cross_entropy(logits, pseudo_labels_tensor, reduction='none')
-        proto_pseudo_loss = (per_sample_loss * pseudo_conf_tensor * sample_class_w).mean()
+        proto_pseudo_loss = torch.tensor(0.0, device=self.device)
+        if supervision_target in {'both', 'prototype'}:
+            logits = compute_prototype_logits(
+                pseudo_z,
+                self.prototypes,
+                temperature=self.config.get('temperature', 0.07),
+                aggregation=self.prototype_pooling,
+                pool_temperature=self.prototype_pool_temperature,
+            )
+            per_sample_loss = F.cross_entropy(logits, pseudo_labels_tensor, reduction='none')
+            proto_pseudo_loss = (per_sample_loss * pseudo_conf_tensor * sample_class_w).mean()
 
         # Classifier 头 pseudo loss（同时监督主推理头）
         clf_pseudo_loss = torch.tensor(0.0, device=self.device)
-        if self.classifier is not None and h is not None:
+        if supervision_target in {'both', 'classifier'} and self.classifier is not None and h is not None:
             pseudo_h = h[pseudo_mask_t]
-            clf_logits = self._forward_classifier(pseudo_h, return_aux=False)
+            clf_logits = self.classifier(pseudo_h)
             clf_per_sample = F.cross_entropy(clf_logits, pseudo_labels_tensor, reduction='none')
             clf_pseudo_loss = (clf_per_sample * pseudo_conf_tensor * sample_class_w).mean()
 
@@ -1780,7 +1715,7 @@ class SemiSupervisedTrainer(Trainer):
         clf_loss = torch.tensor(0.0, device=self.device)
         if self.classifier is not None and self.memory_h is not None:
             h_pseudo = torch.from_numpy(self.memory_h[idx]).float().to(self.device)
-            clf_logits = self._forward_classifier(h_pseudo, return_aux=False)
+            clf_logits = self.classifier(h_pseudo)
             clf_per_sample = F.cross_entropy(clf_logits, pseudo_labels_t, reduction='none')
             clf_loss = (clf_per_sample * pseudo_conf_t * sample_class_w).mean()
 
@@ -1798,6 +1733,7 @@ class SemiSupervisedTrainer(Trainer):
         epoch_metrics = {
             'total_loss': 0.0,
             'contrast_loss': 0.0,
+            'supcon_loss': 0.0,
             'proto_loss': 0.0,
             'ce_loss': 0.0,
             'hard_negative_loss': 0.0,
@@ -1823,6 +1759,7 @@ class SemiSupervisedTrainer(Trainer):
             pbar.set_postfix({
                 'loss': f"{loss_dict['total_loss']:.4f}",
                 'ctr': f"{loss_dict.get('contrast_loss', 0.0):.4f}",
+                'sup': f"{loss_dict.get('supcon_loss', 0.0):.4f}",
                 'proto': f"{loss_dict.get('proto_loss', 0.0):.4f}",
                 'ce': f"{loss_dict.get('ce_loss', 0.0):.4e}",
                 'pseudo': f"{loss_dict.get('pseudo_loss', 0.0):.4e}",
@@ -1876,6 +1813,7 @@ class SemiSupervisedTrainer(Trainer):
         out = {
             'total_loss': loss_dict['total_loss'],
             'contrast_loss': loss_dict.get('contrast_loss', 0.0),
+            'supcon_loss': loss_dict.get('supcon_loss', 0.0),
             'proto_loss': loss_dict.get('proto_loss', 0.0),
             'pseudo_loss': loss_dict.get('pseudo_loss', 0.0),
             'consistency_loss': loss_dict.get('consistency_loss', 0.0),
@@ -1947,6 +1885,7 @@ class SemiSupervisedTrainer(Trainer):
                 self.history['train_loss'].append(train_metrics['total_loss'])
                 self.history['val_loss'].append(val_metrics['total_loss'])
                 self.history['contrast_loss'].append(train_metrics.get('contrast_loss', 0.0))
+                self.history['supcon_loss'].append(train_metrics.get('supcon_loss', 0.0))
                 self.history['proto_loss'].append(train_metrics.get('proto_loss', 0.0))
                 self.history['ce_loss'].append(train_metrics.get('ce_loss', 0.0))
                 self.history['hard_negative_loss'].append(train_metrics.get('hard_negative_loss', 0.0))
@@ -1963,11 +1902,12 @@ class SemiSupervisedTrainer(Trainer):
                 })
 
                 self.logger.info(
-                    "Epoch {}/{} - Train: {:.4f} [ctr {:.4f} | proto {:.4f} | ce {:.4e} | hard {:.4e} | coarse {:.4e} | pseudo {:.4e} | cons {:.4e}] "
+                    "Epoch {}/{} - Train: {:.4f} [ctr {:.4f} | sup {:.4f} | proto {:.4f} | ce {:.4e} | hard {:.4e} | coarse {:.4e} | pseudo {:.4e} | cons {:.4e}] "
                     "| Val: {:.4f} | Acc: {:.4f} | Macro-F1: {:.4f} | BalAcc: {:.4f} | {}: {:.4f} | LR: {:.6f}".format(
                         epoch + 1, max_epochs,
                         train_metrics['total_loss'],
                         train_metrics.get('contrast_loss', 0.0),
+                        train_metrics.get('supcon_loss', 0.0),
                         train_metrics.get('proto_loss', 0.0),
                         train_metrics.get('ce_loss', 0.0),
                         train_metrics.get('hard_negative_loss', 0.0),
@@ -2143,67 +2083,62 @@ class SemiSupervisedTrainer(Trainer):
             epoch=self.current_epoch,
             teacher_clf_logits=all_teacher_clf_logits
         )
-        generator_outputs = {}
-        if hasattr(pseudo_label_generator, 'get_last_outputs'):
-            generator_outputs = pseudo_label_generator.get_last_outputs() or {}
-        seed_probabilities = generator_outputs.get('probabilities')
-        # ====== 图式伪标签传播（LP） + 融合 ======
-        # 全局 kNN 图仅供 LP 使用，在此按 interval 重建
-        try:
-            if self.current_epoch % max(1, self.graph_build_interval) == 0:
-                self._rebuild_global_knn_graph()
-        except Exception as e:
-            self.logger.warning(f"Global graph build failed: {e}")
-            self.global_knn_indices = None
-        try:
-            glp_labels, glp_conf = graph_label_propagation(
-                projected_embeddings=all_z,
-                labels=all_labels,
-                k=self.graph_k,
-                alpha=self.config.get('lp_alpha', 0.9),
-                iters=self.config.get('lp_iters', 20),
-                min_support=self.config.get('lp_min_support', 0.60),
-                conf_power=self.config.get('pseudo_lp_conf_power', 0.75),
-                min_purity=self.config.get('pseudo_lp_min_purity', 0.0),
-                seed_probabilities=seed_probabilities,
-                graph_temperature=self.config.get('lp_graph_temperature', 0.20),
-                mutual_knn=self.config.get('lp_mutual_knn', True),
-                seed_weight=self.config.get('lp_seed_weight', 0.35),
-                entropy_weight=self.config.get('lp_entropy_weight', 0.20),
-                neighbor_agreement_weight=self.config.get('lp_neighbor_agreement_weight', 0.25),
-            )
-            static_thr = float(self.config.get('pseudo_label_threshold', 0.8))
-            if hasattr(pseudo_label_generator, '_get_dynamic_threshold'):
-                thr = pseudo_label_generator._get_dynamic_threshold(self.current_epoch)
-            else:
-                thr = static_thr
+        use_graph_lp = bool(self.config.get('use_graph_lp', False))
+        if use_graph_lp:
+            try:
+                if self.current_epoch % max(1, self.graph_build_interval) == 0:
+                    self._rebuild_global_knn_graph()
+            except Exception as e:
+                self.logger.warning(f"Global graph build failed: {e}")
+                self.global_knn_indices = None
+            try:
+                glp_labels, glp_conf = graph_label_propagation(
+                    projected_embeddings=all_z,
+                    labels=all_labels,
+                    k=self.graph_k,
+                    alpha=self.config.get('lp_alpha', 0.9),
+                    iters=self.config.get('lp_iters', 20),
+                    min_support=self.config.get('lp_min_support', 0.60),
+                    conf_power=self.config.get('pseudo_lp_conf_power', 0.75),
+                    min_purity=self.config.get('pseudo_lp_min_purity', 0.0),
+                )
+                static_thr = float(self.config.get('pseudo_label_threshold', 0.8))
+                if hasattr(pseudo_label_generator, '_get_dynamic_threshold'):
+                    thr = pseudo_label_generator._get_dynamic_threshold(self.current_epoch)
+                else:
+                    thr = static_thr
+                candidate_base = int(((all_labels < 0) & (new_labels >= 0)).sum())
+                candidate_lp = int(((all_labels < 0) & (glp_labels >= 0)).sum())
+                candidate_agree = int(((all_labels < 0) & (new_labels >= 0) & (glp_labels >= 0) & (new_labels == glp_labels)).sum())
+                self.logger.info(
+                    f"Pseudo candidates before fuse: base={candidate_base}, lp={candidate_lp}, agree={candidate_agree}, "
+                    f"lp_mean_conf={float(glp_conf[all_labels < 0].mean()) if (all_labels < 0).any() else 0.0:.3f}"
+                )
+                fused_labels, fused_conf, pseudo_sources = fuse_pseudo_labels(
+                    base_labels=new_labels,
+                    base_conf=confidences,
+                    glp_labels=glp_labels,
+                    glp_conf=glp_conf,
+                    observed_labels=all_labels,
+                    thr=max(0.5, min(0.95, thr)),
+                    lp_thr=self.config.get('pseudo_lp_threshold', 0.92),
+                    conflict_thr=self.config.get('pseudo_conflict_threshold', 0.95),
+                    conflict_margin=self.config.get('pseudo_conflict_margin', 0.15),
+                    allow_lp_only=self._current_allow_lp_only(),
+                    lp_agree_bonus=self.config.get('pseudo_lp_agree_bonus', 0.0),
+                    lp_agree_threshold_offset=self.config.get('pseudo_lp_agree_threshold_offset', 0.03),
+                    return_sources=True,
+                )
+                new_labels = fused_labels
+                confidences = fused_conf
+                self.logger.info("Pseudo labels fused with Graph LP.")
+            except Exception as e:
+                self.logger.warning(f"Graph LP failed, use base pseudo labels only: {e}")
+        else:
             candidate_base = int(((all_labels < 0) & (new_labels >= 0)).sum())
-            candidate_lp = int(((all_labels < 0) & (glp_labels >= 0)).sum())
-            candidate_agree = int(((all_labels < 0) & (new_labels >= 0) & (glp_labels >= 0) & (new_labels == glp_labels)).sum())
             self.logger.info(
-                f"Pseudo candidates before fuse: base={candidate_base}, lp={candidate_lp}, agree={candidate_agree}, "
-                f"lp_mean_conf={float(glp_conf[all_labels < 0].mean()) if (all_labels < 0).any() else 0.0:.3f}"
+                f"Pseudo candidates before cap: teacher/base={candidate_base}, graph_lp=disabled"
             )
-            fused_labels, fused_conf, pseudo_sources = fuse_pseudo_labels(
-                base_labels=new_labels,
-                base_conf=confidences,
-                glp_labels=glp_labels,
-                glp_conf=glp_conf,
-                observed_labels=all_labels,
-                thr=max(0.5, min(0.95, thr)),
-                lp_thr=self.config.get('pseudo_lp_threshold', 0.92),
-                conflict_thr=self.config.get('pseudo_conflict_threshold', 0.95),
-                conflict_margin=self.config.get('pseudo_conflict_margin', 0.15),
-                allow_lp_only=self._current_allow_lp_only(),
-                lp_agree_bonus=self.config.get('pseudo_lp_agree_bonus', 0.0),
-                lp_agree_threshold_offset=self.config.get('pseudo_lp_agree_threshold_offset', 0.03),
-                return_sources=True,
-            )
-            new_labels = fused_labels
-            confidences = fused_conf
-            self.logger.info("Pseudo labels fused with Graph LP.")
-        except Exception as e:
-            self.logger.warning(f"Graph LP failed, use base pseudo labels only: {e}")
 
         # 伪标签采纳上限：阻止后期确认偏差雪崩
         max_rate = self._current_pseudo_cap_rate()
@@ -2222,8 +2157,35 @@ class SemiSupervisedTrainer(Trainer):
         # 每类配额限制（可选）
         quota = int(self.config.get('pseudo_class_quota_per_update', 0))
         if quota > 0:
+            quota_cfg = quota
+            if bool(self.config.get('pseudo_dynamic_class_quota', False)):
+                bootstrap = int(self.config.get('pseudo_class_quota_bootstrap_per_class', min(2, quota)))
+                quality_bins = [float(v) for v in (self.config.get('pseudo_class_quota_quality_bins', [0.70, 0.80, 0.90]) or [0.70, 0.80, 0.90])]
+                quota_values = [int(v) for v in (self.config.get('pseudo_class_quota_bin_values', [0, 2, 4, 6]) or [0, 2, 4, 6])]
+                quality_bins = sorted(quality_bins)
+                if len(quota_values) != len(quality_bins) + 1:
+                    quota_values = [0, 2, 4, max(0, quota)]
+                quota_map = {}
+                for cls in range(self.num_classes):
+                    quality = self.pseudo_class_precision_ema.get(cls)
+                    if quality is None:
+                        quota_map[int(cls)] = max(0, min(quota, bootstrap))
+                        continue
+                    qv = float(quality)
+                    bucket_idx = 0
+                    while bucket_idx < len(quality_bins) and qv >= quality_bins[bucket_idx]:
+                        bucket_idx += 1
+                    quota_map[int(cls)] = max(0, min(quota, quota_values[bucket_idx]))
+                quota_cfg = quota_map
+                label_names = self._label_names()
+                quota_str = ', '.join(
+                    f"{label_names.get(cls, cls)}:{quota_map.get(cls, 0)}"
+                    for cls in range(self.num_classes)
+                )
+                self.logger.info(f"Pseudo dynamic quota: [{quota_str}]")
+
             new_labels, confidences = class_balanced_pseudo_cap(
-                new_labels, confidences, all_labels, quota_per_class=quota
+                new_labels, confidences, all_labels, quota_per_class=quota_cfg
             )
 
         if 'pseudo_sources' not in locals():
@@ -2243,7 +2205,7 @@ class SemiSupervisedTrainer(Trainer):
         total_unlabeled = int(unlabeled_mask.sum())
         adoption_rate = adopted / max(total_unlabeled, 1)
 
-        label_names = {0: 'walk', 1: 'bike', 2: 'bus', 3: 'car', 4: 'subway'}
+        label_names = self._label_names()
         per_class_str = ', '.join([
             f"{label_names.get(c, c)}:{int((new_labels[adopted_mask] == c).sum())}"
             for c in range(self.num_classes)
@@ -2279,6 +2241,10 @@ class SemiSupervisedTrainer(Trainer):
             f"({adoption_rate:.1%}){cap_info} | {conf_info} | {source_info} | per-class: [{per_class_str}]"
         )
 
+        if adopted > 0 and bool(self.config.get('reset_patience_on_pseudo_adoption', True)):
+            self.patience_counter = 0
+            self.logger.info("Pseudo adoption detected: reset patience counter")
+
         pseudo_monitor = self._build_pseudo_monitor(all_labels, new_labels, confidences, pseudo_sources)
         self.last_pseudo_monitor = {
             'adoption_rate': float(adoption_rate),
@@ -2286,7 +2252,7 @@ class SemiSupervisedTrainer(Trainer):
         }
         self.history.setdefault('pseudo_monitor', []).append(self.last_pseudo_monitor)
 
-        label_names = {0: 'walk', 1: 'bike', 2: 'bus', 3: 'car', 4: 'subway'}
+        label_names = self._label_names()
         monitor_parts = []
         for cls in range(self.num_classes):
             stats = pseudo_monitor.get(cls, {})
@@ -2326,6 +2292,7 @@ class SemiSupervisedTrainer(Trainer):
                     )
                     if self.pseudo_active_epoch is None:
                         self.pseudo_active_epoch = self.current_epoch
+                        self.best_after_pseudo_score = self.best_val_score
 
         # ====== 原型 EMA 更新：默认只用真标签，避免伪标签确认偏差反哺原型 ======
         try:
@@ -2378,5 +2345,3 @@ class SemiSupervisedTrainer(Trainer):
             return 0.0
         t = min(1.0, (self.current_epoch - warmup + 1) / max(1, ramp))
         return target * t
-
-
